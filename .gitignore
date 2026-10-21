@@ -1,0 +1,16 @@
+# 报告输出目录（个人分析结果，不入库）
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
