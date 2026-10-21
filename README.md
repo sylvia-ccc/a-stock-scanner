@@ -91,6 +91,8 @@ cd a-stock-scanner
 python3 webapp/app.py 8080
 # 浏览器打开 http://localhost:8080
 
+# 或零门槛一键启动（macOS 双击 start_mac.command / Windows 双击 start_win.bat）
+
 # 命令行版：扫描一只或多只股票，Markdown 报告输出到 output/
 python3 scripts/stock_scanner.py 603019 601012 600941
 ```
