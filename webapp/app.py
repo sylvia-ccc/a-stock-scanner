@@ -196,6 +196,7 @@ def profit_analysis(f10rows):
 
     latest = f10rows[0]
     lf = val(latest, "KCFJCXSYJLR")
+    lf = round(lf / 1e8, 2) if lf is not None else None   # 元 → 亿元
     yoy = None
     ldate = str(latest.get("REPORT_DATE"))[:10]
     py = str(int(ldate[:4]) - 1) + ldate[4:]
@@ -509,6 +510,202 @@ def build_decision(quote, tech, K, total, g):
             "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels], "notes": notes}
 
 
+# ---------------- 个股深度分析(持仓视角 + 数据范围声明) ----------------
+
+def _kline_with_source(code, mkt):
+    """K线三级源(带来源标记): 腾讯fqkline(前复权) → 新浪日K(不复权)"""
+    closes, dates = ss.fetch_kline(code, mkt)
+    if len(closes) >= 120:
+        return closes, dates, "腾讯 fqkline（前复权）"
+    sym = market_prefix(code) + code
+    url = (f"https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
+           f"?symbol={sym}&scale=240&ma=no&datalen=500")
+    d = _gj(url, retry=2)
+    if isinstance(d, list) and len(d) >= 120:
+        return ([float(x["close"]) for x in d], [x["day"] for x in d],
+                "新浪日K（不复权，除权日附近回撤计算或有失真）")
+    return closes, dates, "腾讯 fqkline（前复权）"
+
+
+def build_holding_decision(quote, tech, K, total, g):
+    """持仓视角三态决策: 持有(hold)/加仓(add)/弃仓(exit), 与 build_decision 的未持仓买入视角互补。
+    规则透明可复算:
+      弃仓 = 任一硬伤命中: ①亏损且净利同比恶化 ②评分<45(D级) ③扣非YoY≤-30%且60日≤-15%(双杀) ④距顶回撤≥50%且创新低路径
+      加仓 = 无硬伤 且 非亏损 且 评级A/B 且 60日企稳(≥-5%) 且 现金流非负或扣非增长
+      持有 = 其余: 给出「转加仓」与「转弃仓」双向触发价位
+    """
+    price = quote.get("现价")
+    if not price or not tech:
+        return None
+    lo, hi = tech["52周低"], tech["52周高"]
+    m60 = tech["近60日%"] if tech["近60日%"] is not None else -99
+    ma20 = round(price / (1 + tech["相对MA20%"] / 100), 2)
+    dd = tech["距52周高点%"]
+    stable = m60 >= -5
+    falling = m60 <= -15
+    loss = K.get("亏损")
+    cfo = K.get("每股现金流")
+    kf = K.get("扣非YoY")
+    npy = K.get("净利YoY")
+    stop = round(lo * 0.97, 2)
+    trim = round(hi * 0.95, 2)
+    add1 = round(max(price * 0.92, lo * 1.05), 2)
+    add2 = round(max(price * 0.85, lo * 1.02), 2)
+
+    exit_reasons = []
+    if loss and (npy is not None and npy < 0):
+        exit_reasons.append(f"当期亏损且同比恶化（净利YoY {npy:+.1f}%）")
+    if total < 45:
+        exit_reasons.append(f"综合评分 {total} < 45（D级，多项基本面不达标）")
+    if kf is not None and kf <= -30 and m60 <= -15:
+        exit_reasons.append(f"扣非同比 {kf:+.1f}% 恶化 + 60日 {m60:+.1f}% 下跌，基本面技术面双杀")
+    if dd <= -50 and falling:
+        exit_reasons.append(f"距52周高点 {dd:.1f}% 深度回撤且仍在创新低路径")
+
+    can_add = (not exit_reasons and not loss and (g.startswith("A") or g.startswith("B"))
+               and stable and (cfo is None or cfo >= 0 or (kf or 0) > 0))
+
+    notes_common = ["价位口径：与建仓决策一致（52周区间反推），以收盘价确认触发",
+                    "财报窗口：正式财报落地后所有决策需重估，避开财报日博弈",
+                    "本决策为「已持仓」视角；若尚未持仓请参考扫描页的建仓决策卡"]
+    if cfo is not None and cfo < 0:
+        notes_common.append("⚠ 现金流为负：加仓需等财报确认现金流转正，持仓者重点跟踪应收/存货")
+    if (K.get("周期分位") or 0) >= 0.9 and (kf or 0) < 0:
+        notes_common.insert(0, "⚠ 周期顶部风险：年度扣非处近10年高位且同比回落——减仓评估区应提前执行")
+
+    if exit_reasons:
+        full_exit = len(exit_reasons) >= 2 or total < 45
+        action, color = ("弃仓(清仓)", "red") if full_exit else ("弃仓(减半)", "red")
+        summary = ("命中硬伤：" + "；".join(exit_reasons) + "。"
+                   + ("多项硬伤叠加，建议清仓离场，回收资金转配评分更高的标的。" if full_exit
+                      else "建议至少减半仓控制风险，剩余仓位仅在反转证据出现后保留。"))
+        levels = [("清仓/减半执行", price, "条件已命中，不以回本价为锚"),
+                  ("反弹离场参考", ma20, "若来不及离场，反抽20日线(弱反弹高位)分批撤"),
+                  ("无条件红线", stop, f"收盘跌破{stop}，剩余仓位全部离场"),
+                  ("反转复核条件", None, "单季扭亏 + 60日动量转正 双确认后，才可重新评估")]
+        return {"verdict": "exit", "action": action, "color": color, "summary": summary,
+                "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels],
+                "notes": notes_common, "reasons": exit_reasons}
+
+    if can_add:
+        action, color = "加仓", "green"
+        cond = f"评分{total}({g.strip()}) + 60日{m60:+.1f}%企稳" + (" + 现金流为正" if (cfo or 0) >= 0 else " + 扣非仍在增长")
+        summary = f"基本面与位置均支持加仓：{cond}。回踩分批加，单次≤现仓位1/3，避免一次打满。"
+        levels = [("加仓一档", add1, "现价回落8%或接近52周低点5%上方时执行"),
+                  ("加仓二档", add2, "深度回踩区，最后一批"),
+                  ("右侧加仓参考", ma20, "直接放量站稳20日线者可右侧加仓(追价但确定性高)"),
+                  ("止损/减仓红线", stop, "收盘跌破=持仓逻辑证伪，全部离场"),
+                  ("止盈评估区", trim, "接近前高分批止盈或移动止损")]
+        return {"verdict": "add", "action": action, "color": color, "summary": summary,
+                "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels],
+                "notes": notes_common, "reasons": []}
+
+    action, color = "持有", "gold"
+    up = f"转「加仓」：收盘站稳 {ma20}（20日线）且 60日动量转正" + ("，或财报确认现金流转正" if (cfo or 0) < 0 else "")
+    down = f"转「弃仓」：收盘跌破 {stop}（52周低点×0.97），或财报出现新增硬伤（亏损/扣非大幅恶化/解禁冲击）"
+    summary = (f"评分{total}({g.strip()})、60日{m60:+.1f}%，处于「可持有但不满足加仓标准」的中间态："
+               f"{'尚在下跌通道，等右侧信号' if falling else '评级未达加仓线，等评分或动量改善'}。")
+    levels = [("转加仓触发", ma20, "站稳20日线+动量转正→按加仓规则分批"),
+              ("加仓预备档(激进)", add1, "不愿等右侧者：接近52周低点5%上方小批补，仓位≤1/4"),
+              ("转弃仓红线", stop, "收盘跌破无条件离场，不等反弹"),
+              ("止盈评估区", trim, "接近前高评估部分止盈")]
+    return {"verdict": "hold", "action": action, "color": color, "summary": summary,
+            "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels],
+            "notes": notes_common + [f"转加仓条件：{up}", f"转弃仓条件：{down}"], "reasons": []}
+
+
+def _build_data_range(quote, dates, closes, ksrc, earn, divs, lifts, f10_n):
+    """数据范围声明: 每项数据的来源/覆盖区间/截至时间/口径备注"""
+    ts = quote.get("行情时间") or ""
+    qtime = (f"{ts[:4]}-{ts[4:6]}-{ts[6:8]} {ts[8:10]}:{ts[10:12]}" if len(ts) >= 12 else "最近收盘")
+    earn_dates = sorted({e.get("日期") for e in earn if e.get("日期")})
+    div_from = min((r.get("公告日") or "") for r in divs) if divs else "-"
+    div_to = max((r.get("公告日") or "") for r in divs) if divs else "-"
+    return [
+        {"项": "实时行情", "来源": "腾讯 qt.gtimg.cn", "覆盖": f"截至 {qtime}",
+         "口径": "盘中=实时快照；收盘后=当日收盘价（长线口径通用）"},
+        {"项": "日K线", "来源": ksrc, "覆盖": f"{dates[0]} ~ {dates[-1]}（{len(closes)} 根）",
+         "口径": "约2年窗口；技术位（52周高低/均线/动量）基于此计算"},
+        {"项": "财务数据", "来源": "东财业绩报表", "覆盖": "；".join(earn_dates) or "-",
+         "口径": "最新中报+年报+两个同期；季报披露后自动更新，评分随报告期滚动"},
+        {"项": "扣非/周期分位", "来源": "东财F10主要指标", "覆盖": f"近 {f10_n} 期（约11年）",
+         "口径": "周期分位基于其中年报样本（≥5个年报才计算），扣非YoY同比匹配上期"},
+        {"项": "分红记录", "来源": "东财分红送配明细", "覆盖": f"{div_from} ~ {div_to}（近8笔）",
+         "口径": "按方案公告日；分红年数取近5年窗口"},
+        {"项": "限售解禁", "来源": "东财解禁时间表", "覆盖": "未来 3 个月",
+         "口径": "免费接口，大宗交易/询价转让减持未包含"},
+        {"项": "商誉/质押/股东户数", "来源": "-", "覆盖": "[MISSING]",
+         "口径": "免费接口未覆盖，重大决策前请人工核对最近公告"},
+    ]
+
+
+OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output")
+
+
+def deep_analysis(code):
+    """个股深度分析: 复用 scan_json 全量数据 → 持仓三态决策 + 数据范围声明 + Markdown 报告落盘"""
+    base = scan_json(code)
+    if "error" in base:
+        return base
+    c = base["code"]
+    mkt, sfx, _ = ss.market(c)
+    closes, dates, ksrc = _kline_with_source(c, mkt)
+    K = {**base["key"], "扣非YoY": base.get("kfyoy"), "周期分位": base.get("cycle")}
+    hd = build_holding_decision(base["quote"], base["tech"], K, base["total"], base["grade"])
+    dr = _build_data_range(base["quote"], dates, closes, ksrc, base["earn"], base["divs"], base["lifts"], 44)
+
+    # ---- Markdown 报告 ----
+    name, q = base["name"], base["quote"]
+    L = [f"# {name}（{c}）个股深度分析报告",
+         "",
+         f"> 生成时间：{ss.TODAY} ｜ 综合评分：**{base['total']}/{base['grade']}** ｜ 现价：{q.get('现价')} 元",
+         "",
+         "## 一、数据范围声明",
+         "",
+         "| 数据项 | 来源 | 覆盖范围 | 口径备注 |",
+         "|---|---|---|---|"]
+    L += [f"| {r['项']} | {r['来源']} | {r['覆盖']} | {r['口径']} |" for r in dr]
+    L += ["", "## 二、综合评分", "", "| 维度 | 得分 | 满分 | 备注 |", "|---|---|---|---|"]
+    L += [f"| {s['dim']} | {s['score']} | {s['full'] if s['full'] else '—'} | {s['note']} |" for s in base["scorecard"]]
+    L += ["", "## 三、基本面分析", "", "| 报告期 | 营收(亿) | 归母净利(亿) | ROE% | 毛利率% | 营收YoY% | 净利YoY% |", "|---|---|---|---|---|---|---|"]
+    for e in base["earn"]:
+        L.append(f"| {e.get('日期')} | {e.get('营收亿')} | {e.get('归母净利亿')} | {e.get('ROE')} | {e.get('毛利率')} | {e.get('营收YoY')} | {e.get('净利YoY')} |")
+    kf = base.get("kf")
+    cyc = base.get("cycle")
+    L += ["",
+          f"- 扣非净利（最新期）：{kf if kf is not None else 'N/A'} 亿，同比 {base.get('kfyoy') if base.get('kfyoy') is not None else 'N/A'}%",
+          f"- 利润趋势：{base.get('profit_trend')}；周期分位（年度扣非近10年）：{f'{cyc:.0%}' if cyc is not None else 'N/A'}",
+          f"- 分红年数（记录窗口内）：{base['key'].get('分红年数')} 年；股息率：{base['key'].get('股息率')}%",
+          "- 解禁：", ""]
+    L += [f"  - {r['date']} 解禁 {r['num']} 股（占 {r['ratio']}%）" for r in base["lifts"]] or ["  - 未来3个月无限售解禁"]
+    t = base["tech"]
+    L += ["", "## 四、技术面分析", "",
+          f"- 现价 {q.get('现价')}；52周区间 **{t['52周低']} ~ {t['52周高']}**",
+          f"- 距52周高点 {t['距52周高点%']:.1f}%｜距52周低点 +{t['距52周低点%']:.1f}%｜相对MA250 {t['相对MA250%']:+.1f}%｜相对MA20 {t['相对MA20%']:+.1f}%",
+          f"- 动量：60日 {t['近60日%']:+.1f}%｜120日 {(t.get('近120日%') or 0):+.1f}%｜年初至今 {t.get('YTD%') or 0:+.1f}%",
+          "", "## 五、持仓决策（三态：持有/加仓/弃仓）", ""]
+    if hd:
+        L += [f"### 结论：**{hd['action']}**", "", hd["summary"], "",
+              "| 动作 | 价位 | 说明 |", "|---|---|---|"]
+        L += [f"| {l['label']} | {l['price'] if l['price'] is not None else '—'} | {l['note']} |" for l in hd["levels"]]
+        L += [""] + [f"- {n}" for n in hd["notes"]]
+    L += ["", "## 六、专家意见与风险清单", ""] + base["opinion"]
+    L += ["", "---",
+          "*本报告由开源工具 a-stock-scanner 自动生成，全部数据来自公开免费接口，仅供研究参考，不构成投资建议。"
+          "评分与决策基于数据范围声明所列快照，正式财报披露后应重新运行。*", ""]
+    os.makedirs(OUT_DIR, exist_ok=True)
+    md_path = os.path.abspath(os.path.join(OUT_DIR, f"深度分析_{c}_{ss.TODAY}.md"))
+    with open(md_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+
+    base["holding_decision"] = hd
+    base["data_range"] = dr
+    base["kline_source"] = ksrc
+    base["kline_span"] = f"{dates[0]} ~ {dates[-1]}"
+    base["report_file"] = md_path
+    return base
+
+
 # ---------------- 全景扫描(JSON) ----------------
 
 def scan_json(code):
@@ -631,6 +828,7 @@ th{color:var(--sub);font-weight:500;font-size:12px}
       <button onclick="doScan(document.getElementById('q').value.trim())">扫描</button>
       <div class="sugg-list" id="sugg"></div>
     </div>
+    <div id="deepBox" style="display:none;margin-top:14px"></div>
     <div id="result"><div class="card muted">输入代码开始扫描；也可在「策略选股」中点击任意标的直达扫描。</div></div>
   </div>
 
@@ -755,6 +953,7 @@ function render(d){
     <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px">
       <span style="background:${decColor};color:#fff;padding:5px 16px;border-radius:8px;font-size:15px;font-weight:700">${dec.action}</span>
       <span class="muted">价格基准：${dec.basis}（长线口径，盘中/收盘均可）</span>
+      <button style="margin-left:auto" onclick="doDeep('${d.code}')">🧪 深度分析（持仓/加仓/弃仓）</button>
     </div>
     <p style="line-height:1.7">${dec.summary}</p>
     <table style="margin-top:10px">
@@ -784,7 +983,7 @@ function render(d){
           <span>YTD ${pct(t['YTD%'])}</span>
           <span>PE ${fmt(k.PE,1)} ${k.PEG||''}</span>
           <span>股息率 ${fmt(k.股息率)}%</span>
-          <span>扣非(H1) ${d.kf===null||d.kf===undefined?'—':fmt(d.kf/1e8,1)+'亿'}${d.kfyoy!==null&&d.kfyoy!==undefined?` <span class="${d.kfyoy<0?'dn':'up'}">(${d.kfyoy>0?'+':''}${d.kfyoy}%)</span>`:''}</span>
+          <span>扣非(H1) ${d.kf===null||d.kf===undefined?'—':fmt(d.kf,2)+'亿'}${d.kfyoy!==null&&d.kfyoy!==undefined?` <span class="${d.kfyoy<0?'dn':'up'}">(${d.kfyoy>0?'+':''}${d.kfyoy}%)</span>`:''}</span>
         </div>
       </div>
     </div>
@@ -801,8 +1000,48 @@ function render(d){
     <p class="muted" style="margin-top:10px">*报告由自动化工具生成，仅供研究参考，不构成投资建议；财报披露后应重新评估。*</p></div>`;
 }
 
-async function runScreen(st){
-  const box=$('#screenResult');
+async function doDeep(code){
+  const box=$('#deepBox');
+  box.style.display='';
+  box.className='card loading';
+  box.innerHTML='深度分析中…（在扫描数据基础上追加F10扣非/持仓三态决策/报告生成，约8~15秒）';
+  box.scrollIntoView({behavior:'smooth',block:'start'});
+  try{
+    const r=await fetch('/api/deep?code='+code);const d=await r.json();
+    if(d.error){box.className='card warn';box.textContent='✗ '+d.error;return}
+    const hd=d.holding_decision;
+    const hdColor=hd?{green:'#1a9c6b',orange:'#c98a1b',gold:'#8a7a1b',red:'#d63a3a'}[hd.color]||'#5b6472':'#5b6472';
+    const reasonHtml=(hd.reasons&&hd.reasons.length)?`<p style="margin:6px 0"><b>命中硬伤：</b>${hd.reasons.join('；')}</p>`:'';
+    const drRows=d.data_range.map(r=>`<tr><td><b>${r['项']}</b></td><td class="muted">${r['来源']}</td><td>${r['覆盖']}</td><td class="muted" style="white-space:normal">${r['口径']}</td></tr>`).join('');
+    box.className='card';
+    box.innerHTML=`
+    <div class="logo-t">深度分析报告 · ${d.name}（${d.code}）<span class="muted"> ｜ 生成于 ${d.time} ｜ Markdown 已存至 ${d.report_file.split('/').slice(-2).join('/')}</span></div>
+    ${hd?`
+    <div style="border-left:4px solid ${hdColor};padding:10px 14px;margin:10px 0;background:var(--bg2,rgba(0,0,0,.03));border-radius:0 8px 8px 0">
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <span style="background:${hdColor};color:#fff;padding:6px 18px;border-radius:8px;font-size:16px;font-weight:700">已持仓 → ${hd.action}</span>
+        <span class="muted">评分 ${d.total}/${d.grade} ｜ K线: ${d.kline_span}（${d.kline_source}）</span>
+      </div>
+      ${reasonHtml}
+      <p style="line-height:1.7;margin:8px 0 0">${hd.summary}</p>
+      <table style="margin-top:10px">
+        <tr><th>动作</th><th>价位</th><th>距现价</th><th>说明</th></tr>
+        ${hd.levels.map(l=>`<tr>
+          <td>${l.label}</td>
+          <td><b>${l.price===null||l.price===undefined?'—':fmt(l.price)}</b></td>
+          <td>${l.price===null||l.price===undefined?'—':pct((l.price/(d.quote.现价||1)-1)*100)}</td>
+          <td class="muted" style="white-space:normal">${l.note}</td></tr>`).join('')}
+      </table>
+      ${hd.notes.map(n=>`<p class="muted" style="margin-top:6px">· ${n}</p>`).join('')}
+    </div>
+    <div class="logo-t" style="margin-top:14px">数据范围声明（所有结论仅在下述范围内有效）</div>
+    <table style="margin-top:8px"><tr><th>数据项</th><th>来源</th><th>覆盖范围</th><th>口径备注</th></tr>${drRows}</table>
+    <p class="muted" style="margin-top:10px">完整报告（六大章节：数据范围/评分/基本面/技术面/持仓决策/风险清单）已保存为 Markdown 文件，可直接分享或归档。</p>`
+    :'<p class="warn">持仓决策不可用（行情或K线数据不足）</p>'}`;
+  }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
+}
+
+async function runScreen(st){  const box=$('#screenResult');
   box.className='card loading';box.textContent='正在全市场初筛…（首次需加载全部A股快照，约10~30秒）';
   try{
     const r=await fetch('/api/screen?strategy='+st);const d=await r.json();
@@ -900,6 +1139,10 @@ class Handler(BaseHTTPRequestHandler):
                            json.dumps(res, ensure_ascii=False))
             elif u.path == "/api/scan":
                 d = scan_json(qs.get("code", [""])[0])
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(d, ensure_ascii=False))
+            elif u.path == "/api/deep":
+                d = deep_analysis(qs.get("code", [""])[0])
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(d, ensure_ascii=False))
             elif u.path == "/api/screen":

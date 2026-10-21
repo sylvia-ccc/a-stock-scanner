@@ -154,9 +154,10 @@ def tech_metrics(closes, dates):
             base = v
     ytd = round((cur / base - 1) * 100, 1) if base else None
     m60 = round((cur / closes[-61] - 1) * 100, 1) if len(closes) >= 61 else None
+    m120 = round((cur / closes[-121] - 1) * 100, 1) if len(closes) >= 121 else None
     return {"现价": cur, "52周高": hi, "52周低": lo, "距52周高点%": -dd,
             "距52周低点%": off_lo, "相对MA250%": pos_ma250, "相对MA20%": pos_ma20,
-            "YTD%": ytd, "近60日%": m60}
+            "YTD%": ytd, "近60日%": m60, "近120日%": m120}
 
 
 # ---------------- 评分 ----------------
