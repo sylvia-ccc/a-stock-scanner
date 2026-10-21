@@ -514,6 +514,154 @@ def build_decision(quote, tech, K, total, g):
             "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels], "notes": notes}
 
 
+# ---------------- 决策支持(仓位计划/情景推演/量能/行业对标/关键日历) ----------------
+
+def _volume_trend(code, mkt):
+    """量能: 近5日均量 / 近20日均量(腾讯fqkline第6列, 万手)。数据不足返回 None"""
+    try:
+        beg = f"{int(ss.TODAY[:4])}-01-01"
+        url = (f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?"
+               f"param={mkt}{code},day,{beg},{ss.TODAY},250,qfq")
+        d = _gj(url, retry=1)
+        kl = (((d or {}).get("data") or {}).get(f"{mkt}{code}") or {}).get("qfqday") or []
+        vols = [float(x[5]) for x in kl if len(x) >= 6]
+        if len(vols) < 25:
+            return None
+        v20 = sum(vols[-20:]) / 20
+        return round(sum(vols[-5:]) / 5 / v20, 2) if v20 else None
+    except Exception:
+        return None
+
+
+def _next_report(code, sfx):
+    """下一份财报预约披露日(东财预约披露表, REPORT_DATE 降序取最新)"""
+    from urllib.parse import quote as _qquote
+    try:
+        url = ('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_PUBLIC_BS_APPOIN'
+               '&columns=ALL&pageSize=2&pageNumber=1&sortColumns=REPORT_DATE&sortTypes=-1&filter='
+               + _qquote(f'(SECUCODE="{code}{sfx}")'))
+        d = _gj(url, retry=1)
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        if rows:
+            rd = str(rows[0].get("REPORT_DATE"))[:10]
+            ad = str(rows[0].get("APPOINT_PUBLISH_DATE"))[:10]
+            return {"report_date": rd, "appoint_date": ad}
+    except Exception:
+        return None
+    return None
+
+
+def _industry_bench(ind, pe, m60):
+    """行业对标: 同行业家数/PE中位数与分位/60日涨幅中位数与该股分位(全A快照)"""
+    if not ind:
+        return None
+    stocks = [s for s in (fetch_all_stocks() or []) if s.get("ind") == ind]
+    if len(stocks) < 5:
+        return None
+    pes = sorted(v for s in stocks for v in [_fnum(s["pe"])] if v and v > 0)
+    chgs = sorted(v for s in stocks for v in [_fnum(s["chg60"])] if v is not None)
+    out = {"n": len(stocks), "pe_med": None, "pe_pct": None, "chg_med": None, "chg_pct": None}
+    if pes:
+        out["pe_med"] = round(pes[len(pes) // 2], 1)
+        if pe and pe > 0:
+            out["pe_pct"] = round(sum(1 for v in pes if v <= pe) / len(pes) * 100)
+    if chgs:
+        out["chg_med"] = round(chgs[len(chgs) // 2], 1)
+        if m60 is not None:
+            out["chg_pct"] = round(sum(1 for v in chgs if v <= m60) / len(chgs) * 100)
+    return out
+
+
+def _position_plan(g):
+    """评级 → 建议仓位上限与分批节奏(长线纪律, 按可投资金百分比)"""
+    return {
+        "cap": {"A": "15%~20%", "B": "8%~12%", "C": "0~5%", "D": "0%"}.get(g[0], "0%"),
+        "how": {
+            "A": "首批1/3（现价或企稳触发价），加仓一档、二档各1/3；单一个股不超过总资金20%",
+            "B": "首批1/2试探（≤计划仓位一半），剩余等回踩加仓档；B级不给重仓",
+            "C": "仅观察仓试错（≤5%）或空仓等触发价；触发条件不满足就不动手",
+            "D": "不建仓；移出候选池，待评分回到C以上再评估",
+        }.get(g[0], "不建仓"),
+    }
+
+
+def _scenarios(decision, tech):
+    """三情景推演: 乐观/中性/悲观 → 触发条件 → 应对动作(价位取自决策卡)"""
+    if not decision:
+        return []
+    lv = {l["label"]: l["price"] for l in decision["levels"] if l["price"] is not None}
+    add1 = lv.get("加仓一档") or lv.get("加仓档") or lv.get("激进回踩档") or lv.get("介入触发B(左侧)")
+    stop = lv.get("止损/失效") or lv.get("放弃线")
+    trim = lv.get("减仓评估区")
+    ma20 = lv.get("右侧确认线") or lv.get("企稳触发") or lv.get("介入触发A(右侧)")
+    out = []
+    if ma20 or trim:
+        out.append({"s": "乐观 · 趋势走强",
+                    "cond": (f"收盘站稳 {ma20}（20日线）" if ma20 else "60日动量转正"),
+                    "act": (f"持有待涨；若涨至 {trim}（前高附近）分批止盈1/3~1/2" if trim else "持有，移动止盈跟踪")})
+    else:
+        out.append({"s": "乐观 · 趋势走强", "cond": "评分与动量同步改善", "act": "按分批计划执行，移动止盈跟踪"})
+    out.append({"s": "中性 · 区间震荡",
+                "cond": f"在现价±5%内反复，未触发任何线" ,
+                "act": "严格按分批计划执行，不动用计划外资金；不追高不抢反弹"})
+    if stop:
+        out.append({"s": "悲观 · 破位下行",
+                    "cond": f"收盘跌破 {stop}（52周低点下方3%）",
+                    "act": "无条件离场/移出观察名单，不补仓摊薄；重新评估基本面后再议"})
+    else:
+        out.append({"s": "悲观 · 持续走弱", "cond": "创新低或评分降至D", "act": "回避，移出候选池"})
+    return out
+
+
+def decision_support(code, sfx, quote, tech, K, g, decision, ind, lifts):
+    """个股扫描的决策支持层: 仓位计划+情景推演+量能状态+行业对标+关键日历"""
+    import datetime as _dt
+    out = {}
+    out["position"] = _position_plan(g)
+    out["scenarios"] = _scenarios(decision, tech)
+
+    mkt, _, _ = ss.market(code)
+    vr = _volume_trend(code, mkt)
+    if vr is not None:
+        m60 = tech.get("近60日%") or 0
+        note = ("放量" if vr >= 1.3 else ("缩量" if vr <= 0.7 else "量能平稳"))
+        if vr >= 1.3:
+            note += "上攻，资金活跃" if m60 > 0 else "下跌，抛压重勿接刀"
+        elif vr <= 0.7:
+            note += "回调，抛压减轻（支撑位企稳可关注）" if m60 < 0 else "盘整，等待方向选择"
+        out["volume"] = {"ratio": vr, "note": note}
+    else:
+        out["volume"] = None
+
+    bench = _industry_bench(ind, K.get("PE"), tech.get("近60日%"))
+    out["industry"] = bench
+
+    cal = []
+    nr = _next_report(code, sfx)
+    if nr:
+        try:
+            days = (_dt.date.fromisoformat(nr["appoint_date"]) - _dt.date.fromisoformat(ss.TODAY)).days
+            if days < 0:
+                note = "已披露，待数据入库后重扫"
+            elif days <= 10:
+                note = f"⚠ 距披露仅 {days} 天：临近财报波动放大，建仓分批、不加满"
+            else:
+                note = f"距披露 {days} 天；财报落地前所有价位仅作参考"
+            cal.append({"date": nr["appoint_date"], "event": f"财报披露（报告期 {nr['report_date']}）", "note": note})
+        except Exception:
+            pass
+    for r in (lifts or []):
+        if r.get("date") and r.get("ratio") is not None:
+            try:
+                cal.append({"date": str(r["date"]), "event": f"限售解禁（占总股本 {float(r['ratio']):.1f}%）",
+                            "note": "解禁前1~2周留意抛压，建仓避开"})
+            except Exception:
+                pass
+    cal.sort(key=lambda x: x["date"])
+    out["calendar"] = cal
+    return out
+
+
 # ---------------- 风险因子层(11层扫描, 补齐深度分析遗漏) ----------------
 
 def _industry_pe_percentile(ind, pe):
@@ -1019,7 +1167,26 @@ def deep_analysis(code):
           "| 风险层 | 状态 | 数据日期 | 说明 |", "|---|---|---|---|"]
     st_ico = {"OK": "✅", "WARN": "⚠️", "RISK": "🔴", "NA": "—"}
     L += [f"| {l['name']} | {st_ico[l['status']]} {l['status']} | {l['date'] or '—'} | {l['detail']} |" for l in rl["layers"]]
-    L += ["", "## 七、专家意见与风险清单", ""] + base["opinion"]
+    sup = base.get("support") or {}
+    if sup:
+        L += ["", "## 七、决策支持（仓位 / 情景 / 量能 / 行业对标 / 日历）", ""]
+        pos = sup.get("position") or {}
+        L += [f"- **仓位计划**：建议上限 **{pos.get('cap')}**（占可投资金）；{pos.get('how')}"]
+        for s in sup.get("scenarios") or []:
+            L += [f"- **情景·{s['s']}**：触发={s['cond']} → 应对={s['act']}"]
+        v = sup.get("volume")
+        if v:
+            L += [f"- **量能状态**：近5日/20日均量比 {v['ratio']} — {v['note']}"]
+        b = sup.get("industry")
+        if b:
+            L += [f"- **行业对标**：同业 {b['n']} 家；PE中位 {b['pe_med']}"
+                  + (f"（本股 {b['pe_pct']}% 分位）" if b.get("pe_pct") is not None else "")
+                  + f"；行业60日中位 {b['chg_med']}%"
+                  + (f"（本股 {b['chg_pct']}% 分位）" if b.get("chg_pct") is not None else "")]
+        if sup.get("calendar"):
+            L += ["", "| 日期 | 事件 | 提示 |", "|---|---|---|"]
+            L += [f"| {c['date']} | {c['event']} | {c['note']} |" for c in sup["calendar"]]
+    L += ["", "## 八、专家意见与风险清单", ""] + base["opinion"]
     L += ["", "---",
           "*本报告由开源工具 a-stock-scanner 自动生成，全部数据来自公开免费接口，仅供研究参考，不构成投资建议。"
           "评分与决策基于数据范围声明所列快照，正式财报披露后应重新运行。*", ""]
@@ -1103,6 +1270,11 @@ def scan_json(code):
         op_lines.append(f"- **周期顶部提示**：年度扣非处近10年分位 {int(cyc*100)}% 且同比回落 {kfyoy}%，利润率或不可持续，估值锚应打折")
     elif cyc is not None and cyc >= 0.9:
         op_lines.append(f"- 利润创新高：年度扣非处近10年分位 {int(cyc*100)}% 且仍在增长（成长股特征，非周期风险）")
+    time.sleep(0.3)
+    dec = build_decision(quote, tech, K, total, g)
+    ind = next((s.get("ind") for s in (fetch_all_stocks() or []) if s.get("code") == code), None)
+    support = decision_support(code, sfx, quote, tech, K, g, dec, ind,
+                               [{"date": str(r.get("FREE_DATE"))[:10], "num": r.get("LIFT_NUM"), "ratio": r.get("TOTAL_RATIO")} for r in lifts])
     # 趋势补充: 4期净利趋势
     profit_seq = [earn[t]["归母净利亿"] for t in ["prevFY", "FY", "prevH1", "H1"] if t in earn and earn[t]["归母净利亿"] is not None]
     trend = "连续增长" if len(profit_seq) >= 3 and all(profit_seq[i] <= profit_seq[i + 1] for i in range(len(profit_seq) - 1)) and profit_seq[-1] > 0 else (
@@ -1115,11 +1287,12 @@ def scan_json(code):
         })
     return {
         "code": code, "name": quote.get("名称"), "quote": quote, "tech": tech,
-        "ind": next((s.get("ind") for s in (fetch_all_stocks() or []) if s.get("code") == code), None),
+        "ind": ind,
         "earn": [earn[t] for t in ["H1", "FY", "prevH1", "prevFY"] if t in earn],
         "divs": divs[:8], "lifts": [{"date": str(r.get("FREE_DATE"))[:10], "num": r.get("LIFT_NUM"), "ratio": r.get("TOTAL_RATIO")} for r in lifts],
         "scorecard": scorecard, "total": total, "grade": g,
-        "decision": build_decision(quote, tech, K, total, g),
+        "decision": dec,
+        "support": support,
         "key": {k: K.get(k) for k in ["ROE", "毛利率", "营收YoY", "净利YoY", "每股现金流", "PE", "PEG", "分红年数", "股息率", "亏损", "周期分位"]},
         "kf": (pa or {}).get("扣非最新"), "kfyoy": (pa or {}).get("扣非YoY"), "cycle": cyc,
         "opinion": op_lines, "profit_trend": trend, "time": ss.TODAY,
@@ -1428,6 +1601,28 @@ function render(d){
     </table>
     ${dec.notes.map(n=>`<p class="muted" style="margin-top:6px">· ${n}</p>`).join('')}
   </div>`:'';
+  const sup=d.support;
+  const supHtml=sup?`
+  <div class="card"><div class="logo-t">决策支持 · 仓位 / 情景 / 量能 / 行业对标 / 日历</div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin-top:8px">
+      <div style="flex:1;min-width:300px">
+        <table><tr><th colspan="2">📋 仓位计划（长线纪律）</th></tr>
+          <tr><td style="width:90px"><b>建议仓位上限</b></td><td><b>${sup.position.cap}</b>（占可投资金）</td></tr>
+          <tr><td><b>分批节奏</b></td><td class="muted" style="white-space:normal">${sup.position.how}</td></tr></table>
+        <table style="margin-top:8px"><tr><th>🎯 情景推演</th><th>触发条件</th><th>应对动作</th></tr>
+          ${sup.scenarios.map(s=>`<tr><td><b>${s.s}</b></td><td style="white-space:normal">${s.cond}</td><td class="muted" style="white-space:normal">${s.act}</td></tr>`).join('')}</table>
+      </div>
+      <div style="flex:1;min-width:300px">
+        <table>
+          ${sup.volume?`<tr><td style="width:90px"><b>量能状态</b></td><td>近5日/20日均量比 <b>${sup.volume.ratio}</b> — ${sup.volume.note}</td></tr>`:''}
+          ${sup.industry?`<tr><td><b>行业对标</b></td><td style="white-space:normal">${sup.industry.n} 家同业 ｜ PE中位 ${sup.industry.pe_med??'—'}${sup.industry.pe_pct!==null&&sup.industry.pe_pct!==undefined?`，本股处 <b>${sup.industry.pe_pct}%</b> 分位`:''} ｜ 行业60日中位 ${pct(sup.industry.chg_med)}${sup.industry.chg_pct!==null&&sup.industry.chg_pct!==undefined?`，本股处 <b>${sup.industry.chg_pct}%</b> 分位`:''}${sup.industry.pe_pct!==null&&sup.industry.pe_pct<30?`<br><span class="dn">估值低于行业多数同行，若基本面同步走强则性价比突出</span>`:''}${sup.industry.chg_pct!==null&&sup.industry.chg_pct>80?`<br><span class="warn">60日涨幅超行业80%同行：涨幅领先，追高风险大于回踩等待</span>`:''}</td></tr>`:''}
+        </table>
+        ${sup.calendar&&sup.calendar.length?`<table style="margin-top:8px"><tr><th colspan="3">🗓 关键日历</th></tr>
+          ${sup.calendar.map(c=>`<tr><td style="white-space:nowrap"><b>${c.date}</b></td><td>${c.event}</td><td class="${c.note.startsWith('⚠')?'warn':'muted'}" style="white-space:normal">${c.note}</td></tr>`).join('')}</table>`:''}
+      </div>
+    </div>
+    <p class="muted" style="margin-top:6px">*仓位计划为纪律参考（按可投资金百分比），请结合自身风险承受能力调整；情景触发以收盘价为准。*</p>
+  </div>`:'';
 
   $('#result').innerHTML=`
   <div class="card">
@@ -1452,6 +1647,7 @@ function render(d){
     </div>
   </div>
   ${decHtml}
+  ${supHtml}
   <div class="card"><div class="logo-t">评分卡</div><table>${sc}</table></div>
   <div class="card"><div class="logo-t">多期财务</div><table>
     <tr><th>报告期</th><th>营收(亿)</th><th>归母净利(亿)</th><th>ROE%</th><th>毛利率%</th><th>营收YoY</th><th>每股现金流</th></tr>${earn}</table></div>
