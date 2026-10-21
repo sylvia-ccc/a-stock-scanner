@@ -47,13 +47,16 @@ def _fnum(x):
 
 def fetch_all_stocks(max_age=21600):
     """全A快照归一化: code/name/price/pe/pb/mktcap亿/dy/chg60/ytd, 缓存6小时
-    主源: 东财 clist | 备源: 腾讯 rank(东财限流时自动降级, 无PB/股息率)"""
+    主源: 东财 clist | 备源: 腾讯 rank(东财限流时自动降级, 无PB/股息率)
+    防部分抓取: 东财实得<80%总数时尝试腾讯源, 取数量多者(避免漏斗/搜索漏股)"""
     with _LIST_LOCK:
         if time.time() - _LIST_CACHE["ts"] < max_age and _LIST_CACHE["stocks"]:
             return _LIST_CACHE["stocks"]
-    stocks = _fetch_em_list()
-    if not stocks:
-        stocks = _fetch_qq_list()
+    stocks, total = _fetch_em_list()
+    if total and len(stocks) < total * 0.8:
+        qq = _fetch_qq_list()
+        if len(qq) > len(stocks):
+            stocks = qq
     if stocks:
         with _LIST_LOCK:
             _LIST_CACHE.update({"ts": time.time(), "stocks": stocks})
@@ -62,10 +65,11 @@ def fetch_all_stocks(max_age=21600):
 
 def _fetch_em_list():
     stocks, pn, total = [], 1, None
+    pz = 100  # 东财服务端已将每页强制截断为100条(传500也只返回100)
     while True:
-        url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=%d&pz=500&po=1&np=1"
+        url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=%d&pz=%d&po=1&np=1"
                "&fltt=2&invt=2&fid=f12&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
-               "&fields=f12,f14,f2,f9,f23,f20,f24,f25,f133,f100" % pn)
+               "&fields=f12,f14,f2,f9,f23,f20,f24,f25,f133,f100" % (pn, pz))
         d = _gj(url, retry=1)
         data = (d or {}).get("data") or {}
         diff = data.get("diff") or []
@@ -81,11 +85,11 @@ def _fetch_em_list():
                 "mktcap亿": round(cap / 1e8, 1) if cap else None, "dy": r.get("f133"),
                 "chg60": r.get("f24"), "ytd": r.get("f25"), "ind": r.get("f100"),
             })
-        if pn * 500 >= total or pn > 12:
+        if pn * pz >= total or pn > 70:
             break
         pn += 1
-        time.sleep(0.3)
-    return stocks
+        time.sleep(0.2)
+    return stocks, (total or 0)
 
 
 def _fetch_qq_list():
@@ -510,13 +514,28 @@ def build_decision(quote, tech, K, total, g):
             "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels], "notes": notes}
 
 
-# ---------------- 风险因子层(8层扫描, 补齐深度分析遗漏) ----------------
+# ---------------- 风险因子层(11层扫描, 补齐深度分析遗漏) ----------------
 
-def risk_layers(code, K, quote, earn=None):
-    """8层风险因子: 每层输出 {name, status: OK|WARN|RISK|NA, detail}
+def _industry_pe_percentile(ind, pe):
+    """个股PE在行业内的分位(基于全A快照, 缓存6小时)。数据不足或无行业时返回 (None, 0)"""
+    if not ind or pe is None or pe <= 0:
+        return None, 0
+    stocks = fetch_all_stocks() or []
+    pes = sorted(v for s in stocks if s.get("ind") == ind
+                 for v in [_fnum(s["pe"])] if v and v > 0)
+    if len(pes) < 10:
+        return None, len(pes)
+    return sum(1 for v in pes if v <= pe) / len(pes), len(pes)
+
+
+def risk_layers(code, K, quote, earn=None, lifts=None, ind=None):
+    """11层风险因子: 每层输出 {name, status: OK|WARN|RISK|NA, detail}
+    L1应收/存货 L2商誉 L3质押 L4户数 L5减持 L6毛利率 L7现金流背离 L8流动性
+    L9业绩预告 L10限售解禁 L11行业估值分位
     权重: RISK=3分, WARN=1分 → risk_level: 低(≤1)/中(2~3)/高(4~6)/极高(≥7)
     注意: 形参 quote 为行情字典; URL编码用 _qquote, 避免遮蔽"""
     from urllib.parse import quote as _qquote
+    import datetime as _dt
     layers = []
 
     def num(r, k):
@@ -702,6 +721,84 @@ def risk_layers(code, K, quote, earn=None):
     except Exception as e:
         layers.append({"name": "交易流动性", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
 
+    # L9 业绩预告(最新一期: 预减/首亏/续亏/预亏=RISK, 略减=WARN, 预增/略增/扭亏=正向确认)
+    try:
+        d = _gj('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_PUBLIC_OP_NEWPREDICT'
+                '&columns=ALL&pageSize=6&pageNumber=1&sortColumns=NOTICE_DATE&sortTypes=-1&filter='
+                + _qquote(f'(SECUCODE="{scode}")'))
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        d200 = (_dt.datetime.strptime(ss.TODAY, "%Y-%m-%d") - _dt.timedelta(days=200)).strftime("%Y-%m-%d")
+        recent = [r for r in rows if str(r.get("NOTICE_DATE"))[:10] >= d200]
+        if recent:
+            r = recent[0]
+            ptype = str(r.get("PREDICT_TYPE") or "")
+            nd, rd = str(r.get("NOTICE_DATE"))[:10], str(r.get("REPORT_DATE"))[:7]
+            content = (r.get("PREDICT_CONTENT") or "")[:90]
+            if any(t in ptype for t in ("预减", "首亏", "续亏", "预亏")):
+                st = "RISK"
+            elif "略减" in ptype:
+                st = "WARN"
+            else:
+                st = "OK"
+            note = {"RISK": "（公司自己预告业绩恶化，正式财报前最后的逃生窗口）",
+                    "WARN": "（业绩小幅下滑，需跟踪原因）",
+                    "OK": "（业绩预告为正向确认，属于利润提前曝光）"}.get(st, "")
+            layers.append({"name": "业绩预告", "status": st, "date": nd,
+                           "detail": f"{nd} 发布 {rd} 业绩预告【{ptype}】：{content}{note}"})
+        else:
+            layers.append({"name": "业绩预告", "status": "OK", "date": "",
+                           "detail": "近6个月无业绩预告（该报告期未触发强制预告条件，中性）"})
+    except Exception as e:
+        layers.append({"name": "业绩预告", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+    time.sleep(0.4)
+
+    # L10 限售解禁(复用扫描数据: 未来3个月解禁占比)
+    try:
+        near = [(r.get("date"), r.get("ratio")) for r in (lifts or [])
+                if r.get("date") and r.get("ratio") is not None]
+        if near:
+            worst = max(near, key=lambda x: float(x[1] or 0))
+            ratio = float(worst[1] or 0)
+            if ratio >= 5:
+                st = "RISK"
+            elif ratio >= 1:
+                st = "WARN"
+            else:
+                st = "OK"
+            layers.append({"name": "限售解禁", "status": st, "date": str(worst[0]),
+                           "detail": f"未来3个月 {len(near)} 笔解禁，最大单笔占总股本 {ratio:.1f}%（{worst[0]}）"
+                                     + ("（>5% 解禁抛压大，建仓避开解禁日）" if st == "RISK"
+                                        else ("（1~5% 有抛压，需留意）" if st == "WARN" else "（占比小，冲击有限）"))})
+        else:
+            layers.append({"name": "限售解禁", "status": "OK", "date": "", "detail": "未来3个月无限售解禁"})
+    except Exception as e:
+        layers.append({"name": "限售解禁", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+
+    # L11 行业估值分位(PE在行业内的位置 vs 增长匹配度)
+    try:
+        pct_, n = _industry_pe_percentile(ind, K.get("PE"))
+        if pct_ is None:
+            layers.append({"name": "行业估值分位", "status": "NA", "date": "",
+                           "detail": "行业/估值数据不可得（备用源或样本不足）"})
+        else:
+            npy = K.get("净利YoY")
+            if pct_ >= 0.8 and (npy is not None and npy < 10):
+                st = "WARN"
+                extra = f"且净利同比仅 {npy:+.1f}%，估值与增长不匹配（贵得没有理由）"
+            elif pct_ >= 0.8:
+                st = "OK"
+                extra = "（高估值有高增长支撑，跟踪增长持续性）"
+            elif pct_ <= 0.3:
+                st = "OK"
+                extra = "（行业内估值低位，有安全边际；需排除基本面恶化的假便宜）"
+            else:
+                st = "OK"
+                extra = ""
+            layers.append({"name": "行业估值分位", "status": st, "date": "",
+                           "detail": f"PE {K.get('PE')} 处「{ind}」行业 {pct_*100:.0f}% 分位（同业样本 {n} 家）{extra}"})
+    except Exception as e:
+        layers.append({"name": "行业估值分位", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+
     score = sum(3 if l["status"] == "RISK" else (1 if l["status"] == "WARN" else 0) for l in layers)
     level = "低" if score <= 1 else ("中" if score <= 3 else ("高" if score <= 6 else "极高"))
     return {"layers": layers, "score": score, "level": level}
@@ -853,9 +950,11 @@ def deep_analysis(code):
         return base
     c = base["code"]
     mkt, sfx, _ = ss.market(c)
+    # 行业名(用于行业估值分位): 从全A快照查(缓存内零成本)
+    ind = next((s.get("ind") for s in (fetch_all_stocks() or []) if s.get("code") == c), None)
     closes, dates, ksrc = _kline_with_source(c, mkt)
     K = {**base["key"], "扣非YoY": base.get("kfyoy"), "周期分位": base.get("cycle")}
-    rl = risk_layers(c, K, base["quote"], earn=base["earn"])
+    rl = risk_layers(c, K, base["quote"], earn=base["earn"], lifts=base["lifts"], ind=ind)
     risk_block = any(l["status"] == "RISK" for l in rl["layers"])
     hd = build_holding_decision(base["quote"], base["tech"], K, base["total"], base["grade"], risk_block=risk_block)
     dr = _build_data_range(base["quote"], dates, closes, ksrc, base["earn"], base["divs"], base["lifts"], 44)
@@ -867,11 +966,24 @@ def deep_analysis(code):
             elif l["status"] == "WARN":
                 hd["notes"].append(f"⚠ 风险扫描[{l['name']}]：{l['detail']}")
 
+    # 结论速览: 一句话说清 三态决策+评级+风险+预告
+    if hd:
+        parts = [hd["action"], f"评分 {base['total']}/{base['grade']}", f"风险{rl['level']}({rl['score']}分)"]
+        pred_l = next((l for l in rl["layers"] if l["name"] == "业绩预告" and "无业绩预告" not in l["detail"]), None)
+        if pred_l and pred_l["status"] == "RISK":
+            parts.append("业绩预告恶化🔴")
+        elif pred_l and pred_l["status"] in ("OK", "WARN") and any(t in pred_l["detail"] for t in ("预增", "略增", "扭亏")):
+            parts.append("业绩预告正向确认")
+        one_line = " · ".join(parts)
+    else:
+        one_line = None
+
     # ---- Markdown 报告 ----
     name, q = base["name"], base["quote"]
     L = [f"# {name}（{c}）个股深度分析报告",
          "",
          f"> 生成时间：{ss.TODAY} ｜ 综合评分：**{base['total']}/{base['grade']}** ｜ 现价：{q.get('现价')} 元",
+         *(["", f"**结论速览：{one_line}**"] if one_line else []),
          "",
          "## 一、数据范围声明",
          "",
@@ -902,7 +1014,7 @@ def deep_analysis(code):
               "| 动作 | 价位 | 说明 |", "|---|---|---|"]
         L += [f"| {l['label']} | {l['price'] if l['price'] is not None else '—'} | {l['note']} |" for l in hd["levels"]]
         L += [""] + [f"- {n}" for n in hd["notes"]]
-    L += ["", "## 六、风险因子逐层筛查（8层）", "",
+    L += ["", "## 六、风险因子逐层筛查（11层）", "",
           f"**综合风险等级：{rl['level']}（风险分 {rl['score']}，RISK=3分/WARN=1分）**", "",
           "| 风险层 | 状态 | 数据日期 | 说明 |", "|---|---|---|---|"]
     st_ico = {"OK": "✅", "WARN": "⚠️", "RISK": "🔴", "NA": "—"}
@@ -919,10 +1031,44 @@ def deep_analysis(code):
     base["holding_decision"] = hd
     base["data_range"] = dr
     base["risk_layers"] = rl
+    base["ind"] = ind
     base["kline_source"] = ksrc
     base["kline_span"] = f"{dates[0]} ~ {dates[-1]}"
     base["report_file"] = md_path
+    base["one_line"] = one_line
     return base
+
+
+# ---------------- 批量精评 ----------------
+
+def batch_scan(codes):
+    """批量逐股扫描(并发3, 东财友好): 返回按综合评分排序的摘要列表, 供初筛/自选清单二次精评"""
+    codes = [re.sub(r"\D", "", c) for c in codes if re.sub(r"\D", "", c)][:25]
+    if not codes:
+        return {"error": "无有效代码"}
+
+    def work(c):
+        try:
+            d = scan_json(c)
+            return None if "error" in d else d
+        except Exception:
+            return None
+
+    results = []
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        for d in ex.map(work, dict.fromkeys(codes)):
+            if d:
+                results.append(d)
+    results.sort(key=lambda x: -x["total"])
+    return {"count": len(results), "stocks": [{
+        "code": d["code"], "name": d["name"], "ind": d.get("ind"),
+        "total": d["total"], "grade": d["grade"],
+        "price": d["quote"].get("现价"), "pe": d["key"].get("PE"), "roe": d["key"].get("ROE"),
+        "dy": d["key"].get("股息率"), "rev": d["key"].get("营收YoY"),
+        "cfo": d["key"].get("每股现金流"), "kfyoy": d.get("kfyoy"),
+        "dd": d["tech"].get("距52周高点%"), "m60": d["tech"].get("近60日%"),
+        "action": (d["decision"] or {}).get("action"),
+    } for d in results]}
 
 
 # ---------------- 全景扫描(JSON) ----------------
@@ -969,6 +1115,7 @@ def scan_json(code):
         })
     return {
         "code": code, "name": quote.get("名称"), "quote": quote, "tech": tech,
+        "ind": next((s.get("ind") for s in (fetch_all_stocks() or []) if s.get("code") == code), None),
         "earn": [earn[t] for t in ["H1", "FY", "prevH1", "prevFY"] if t in earn],
         "divs": divs[:8], "lifts": [{"date": str(r.get("FREE_DATE"))[:10], "num": r.get("LIFT_NUM"), "ratio": r.get("TOTAL_RATIO")} for r in lifts],
         "scorecard": scorecard, "total": total, "grade": g,
@@ -1032,12 +1179,13 @@ th{color:var(--sub);font-weight:500;font-size:12px}
 <body>
 <div class="wrap">
   <h1>A股全景扫描</h1>
-  <div class="sub">数据源：腾讯行情 · 东财数据中心 ｜ 评分 = 盈利20+成长20+财务15+估值15+位置15+回报10−风险扣分 ｜ 仅供研究参考</div>
+  <div class="sub">数据源：腾讯行情 · 东财数据中心 ｜ 评分 = 盈利20+成长20+财务15+估值15+位置15+回报10−风险扣分 ｜ 深度分析含 11 层风险筛查 ｜ 仅供研究参考</div>
 
   <div class="tabs">
     <button class="on" data-tab="scan">个股扫描</button>
     <button data-tab="screen">策略选股</button>
     <button data-tab="funnel">多轮漏斗选股</button>
+    <button data-tab="watch">自选清单</button>
     <button data-tab="logic">选股逻辑</button>
   </div>
 
@@ -1083,6 +1231,19 @@ th{color:var(--sub);font-weight:500;font-size:12px}
     <div id="funnelResult" class="card muted">尚未运行。建议先用「综合策略 + 10只」体验完整漏斗。</div>
   </div>
 
+  <div id="tab-watch" style="display:none">
+    <div class="card">
+      <div class="logo-t">自选清单（保存在本机浏览器，不上传服务器）。在个股扫描页点 ★ 收藏，然后一键批量精评排序。</div>
+      <div class="searchbar" style="margin-top:10px">
+        <button onclick="batchScore(wl().map(x=>x.code),'wlBatch','自选清单')">⚡ 批量精评全部自选</button>
+        <button onclick="exportWLCsv()">导出 CSV</button>
+        <button onclick="clearWL()">清空</button>
+      </div>
+      <div id="wlBatch"></div>
+      <div id="wlList" style="margin-top:10px"></div>
+    </div>
+  </div>
+
   <div id="tab-logic" style="display:none">
     <div class="card">
       <h3 style="margin-bottom:10px">评分体系（100分 − 风险扣分）</h3>
@@ -1115,6 +1276,24 @@ th{color:var(--sub);font-weight:500;font-size:12px}
         <tr><td>D · 偏弱</td><td>&lt;45</td><td>建议回避/减仓</td></tr>
       </table>
     </div>
+    <div class="card">
+      <h3 style="margin-bottom:10px">深度分析 · 11层风险因子逐层筛查</h3>
+      <table>
+        <tr><th>风险层</th><th>判定规则</th></tr>
+        <tr><td>L1 应收/存货质量</td><td>应收占总资产&gt;30%或存货&gt;40%⚠；应收增速超营收20pct🔴（利润含水量）</td></tr>
+        <tr><td>L2 商誉减值</td><td>商誉/净资产&gt;10%⚠，&gt;20%🔴</td></tr>
+        <tr><td>L3 股权质押</td><td>质押比例&gt;20%⚠，&gt;40%🔴（平仓/控制权风险）</td></tr>
+        <tr><td>L4 筹码集中度</td><td>股东户数环比&gt;+15%⚠（筹码分散，警惕派发）</td></tr>
+        <tr><td>L5 重要股东减持</td><td>近90天有大股东/高管减持⚠</td></tr>
+        <tr><td>L6 毛利率趋势</td><td>同期可比口径下毛利率同比下滑&gt;2pct⚠</td></tr>
+        <tr><td>L7 营收-现金流背离</td><td>营收高增但现金流为负🔴；现金流为负⚠</td></tr>
+        <tr><td>L8 交易流动性</td><td>换手率&lt;0.3%⚠（大资金进出困难）</td></tr>
+        <tr><td>L9 业绩预告</td><td>预减/首亏/续亏/预亏🔴；略减⚠；预增/扭亏为正向确认</td></tr>
+        <tr><td>L10 限售解禁</td><td>未来3个月解禁占总股本&gt;5%🔴，1~5%⚠</td></tr>
+        <tr><td>L11 行业估值分位</td><td>PE处行业80%分位以上且净利同比&lt;10%⚠（估值与增长不匹配）</td></tr>
+      </table>
+      <p class="muted" style="margin-top:8px">计分：RISK=3分、WARN=1分；低≤1 / 中2~3 / 高4~6 / 极高≥7。任一RISK将阻断「加仓」降级为「持有」。</p>
+    </div>
   </div>
 </div>
 
@@ -1125,8 +1304,72 @@ let suggTimer=null,suggPick=false;
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');
-  ['scan','screen','funnel','logic'].forEach(t=>$('#tab-'+t).style.display=t===b.dataset.tab?'':'none');
+  ['scan','screen','funnel','watch','logic'].forEach(t=>$('#tab-'+t).style.display=t===b.dataset.tab?'':'none');
+  if(b.dataset.tab==='watch')renderWL();
 });
+
+// ---------------- 自选清单(localStorage) ----------------
+const wl=()=>{try{return JSON.parse(localStorage.getItem('as_wl')||'[]')}catch(e){return []}};
+function saveWL(l){localStorage.setItem('as_wl',JSON.stringify(l));if(!document.getElementById('tab-watch').hidden&&document.getElementById('tab-watch').style.display!=='none')renderWL();}
+function toggleWL(c,n){
+  const l=wl();const i=l.findIndex(x=>x.code===c);
+  if(i>=0){l.splice(i,1)}else{l.unshift({code:c,name:n})}
+  saveWL(l);refreshStars();
+  toast(i>=0?`已从自选移除 ${n}`:`已加入自选 ${n} ★`);
+}
+function refreshStars(){document.querySelectorAll('[data-wlstar]').forEach(b=>{const c=b.dataset.wlstar;b.textContent=wl().some(x=>x.code===c)?'★ 已自选':'☆ 加自选'})}
+function clearWL(){if(wl().length&&confirm('确定清空自选清单？')){saveWL([]);refreshStars()}}
+function toast(msg){
+  const t=document.createElement('div');t.textContent=msg;
+  t.style.cssText='position:fixed;bottom:28px;left:50%;transform:translateX(-50%);background:#1a1f27;color:#fff;padding:9px 20px;border-radius:22px;font-size:13px;z-index:99;box-shadow:0 6px 18px rgba(0,0,0,.25)';
+  document.body.appendChild(t);setTimeout(()=>t.remove(),2200);
+}
+function renderWL(){
+  const l=wl();
+  $('#wlList').innerHTML=l.length?`<table><tr><th>名称</th><th>代码</th><th>操作</th></tr>${l.map(s=>`
+    <tr><td><b>${s.name}</b></td><td class="muted">${s.code}</td>
+    <td><button onclick="doScan('${s.code}');switchTab('scan')">扫描</button>
+    <button onclick="doDeepDirect('${s.code}','${s.name}')">深度</button>
+    <button onclick="toggleWL('${s.code}','${s.name}');renderWL()">移除</button></td></tr>`).join('')}</table>`
+    :'<span class="muted">清单为空：在「个股扫描」结果页点「☆ 加自选」收藏标的。</span>';
+}
+function switchTab(t){document.querySelector(`.tabs button[data-tab="${t}"]`).click()}
+
+// ---------------- CSV 导出 ----------------
+function dlCSV(name,head,rows){
+  const csv='\ufeff'+[head,...rows].map(r=>r.map(v=>`"${String(v===null||v===undefined?'':v).replace(/"/g,'""')}"`).join(',')).join('\n');
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv'}));a.download=name;a.click();
+}
+
+// ---------------- 批量精评 ----------------
+async function batchScore(codes,boxId,label){
+  codes=[...new Set(codes.filter(Boolean))].slice(0,25);
+  if(!codes.length){toast('清单为空');return}
+  const box=$('#'+boxId);
+  box.className='card loading';box.style.display='';
+  box.innerHTML=`批量精评中… 共 ${codes.length} 只逐股扫描（约 ${Math.ceil(codes.length*0.08)}~${Math.ceil(codes.length*0.15)} 分钟），请勿关闭页面`;
+  try{
+    const r=await fetch('/api/batch?codes='+codes.join(','));const d=await r.json();
+    if(d.error||!d.stocks.length){box.className='card warn';box.textContent='✗ '+(d.error||'无可评标的');return}
+    box.className='card';
+    const rows=d.stocks.map((f,i)=>{
+      const gc=f.total>=75?'#1a9c6b':(f.total>=60?'#2b5fd9':(f.total>=45?'#c98a1b':'#d63a3a'));
+      return `<tr style="cursor:pointer" onclick="doScan('${f.code}');switchTab('scan')">
+      <td>${i+1}</td><td><b>${f.name}</b><div class="muted">${f.code}${f.ind?' · '+f.ind:''}</div></td>
+      <td><b style="color:${gc}">${f.total}</b> ${f.grade}</td>
+      <td><span class="tag">${f.action||'—'}</span></td>
+      <td>${fmt(f.price)}</td><td>${fmt(f.pe,1)}</td><td>${fmt(f.roe,1)}%</td><td>${fmt(f.dy)}%</td>
+      <td>${pct(f.rev)}</td><td class="${(f.cfo||0)<0?'dn':''}">${fmt(f.cfo,3)}</td>
+      <td>${f.kfyoy===null||f.kfyoy===undefined?'—':`<span class="${f.kfyoy<0?'dn':'up'}">${f.kfyoy>0?'+':''}${f.kfyoy}%</span>`}</td>
+      <td>${pct(f.dd)}</td><td>${pct(f.m60)}</td>
+      <td><button onclick="event.stopPropagation();doDeepDirect('${f.code}','${f.name}')">深度</button></td></tr>`;
+    }).join('');
+    box.innerHTML=`<div class="logo-t">${label} · 批量精评 ${d.count} 只（按综合评分排序；点击行进入完整扫描，「深度」直达11层风险分析）</div>
+    <table><tr><th>#</th><th>标的</th><th>评分</th><th>建议</th><th>现价</th><th>PE</th><th>ROE</th><th>股息率</th><th>营收YoY</th><th>现金流</th><th>扣非YoY</th><th>距52周高</th><th>60日</th><th></th></tr>${rows}</table>`;
+  }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
+}
+function exportWLCsv(){const l=wl();if(!l.length){toast('清单为空');return}
+  dlCSV(`自选清单_${new Date().toISOString().slice(0,10)}.csv`,['代码','名称'],l.map(s=>[s.code,s.name]))}
 
 const qEl=$('#q'),suggEl=$('#sugg');
 qEl.addEventListener('input',()=>{clearTimeout(suggTimer);const v=qEl.value.trim();if(v.length<1){suggEl.style.display='none';return}suggTimer=setTimeout(()=>search(v),200)});
@@ -1191,7 +1434,8 @@ function render(d){
     <div class="score-hero">
       <div class="gauge" style="background:${gc}"><div class="n">${d.total}</div><div class="g">${d.grade}</div></div>
       <div class="hero-r">
-        <div class="nm">${d.name} <span class="muted">${d.code}</span> <span class="tag">${d.profit_trend}</span>${k.亏损?'<span class="tag warn">当期亏损</span>':''}${(d.cycle||0)>=0.9?(d.kfyoy||0)<0?`<span class="tag warn">⚠周期高位回落(分位${Math.round(d.cycle*100)}%)</span>`:`<span class="tag">利润创新高(分位${Math.round(d.cycle*100)}%)</span>`:''}</div>
+        <div class="nm">${d.name} <span class="muted">${d.code}</span> <span class="tag">${d.profit_trend}</span>${k.亏损?'<span class="tag warn">当期亏损</span>':''}${(d.cycle||0)>=0.9?(d.kfyoy||0)<0?`<span class="tag warn">⚠周期高位回落(分位${Math.round(d.cycle*100)}%)</span>`:`<span class="tag">利润创新高(分位${Math.round(d.cycle*100)}%)</span>`:''}
+          <button data-wlstar="${d.code}" onclick="toggleWL('${d.code}','${(d.name||'').replace(/'/g,'')}')" style="margin-left:8px;padding:3px 12px;border:1px solid var(--line);border-radius:14px;background:var(--card);cursor:pointer;font-size:12px">☆ 加自选</button></div>
         <div class="px">现价 <b>${fmt(q.现价)}</b> ${pct(q['涨跌%'])}<span class="muted"> ｜ 总市值 ${fmt(q.总市值亿,0)}亿 ｜ 换手 ${fmt(q.换手率,2)}% ｜ ${d.time}</span></div>
         <div class="kv">
           <span>52周: ${fmt(t['52周低'])} ~ ${fmt(t['52周高'])}</span>
@@ -1217,6 +1461,15 @@ function render(d){
   </div>
   <div class="card"><div class="logo-t">专家意见</div><ul class="op">${d.opinion.map(l=>`<li>${l}</li>`).join('')}</ul>
     <p class="muted" style="margin-top:10px">*报告由自动化工具生成，仅供研究参考，不构成投资建议；财报披露后应重新评估。*</p></div>`;
+  refreshStars();
+}
+
+// 一键直达深度分析(从选股/自选/批量结果进入): 先完整扫描再深度分析
+async function doDeepDirect(code,name){
+  switchTab('scan');
+  qEl.value=(name||'')+' '+code;
+  await doScan(code);
+  doDeep(code);
 }
 
 async function doDeep(code){
@@ -1236,7 +1489,7 @@ async function doDeep(code){
     const rlIco={OK:'✅',WARN:'⚠️',RISK:'🔴',NA:'—'};
     const rlLevel=rl?{低:'#1a9c6b',中:'#c98a1b',高:'#d67a1b',极高:'#d63a3a'}[rl.level]||'#5b6472':'#5b6472';
     const rlHtml=rl?`
-    <div class="logo-t" style="margin-top:14px">风险因子逐层筛查（8层）· 综合风险：<span style="color:${rlLevel};font-weight:700">${rl.level}</span>（风险分 ${rl.score}）</div>
+    <div class="logo-t" style="margin-top:14px">风险因子逐层筛查（11层）· 综合风险：<span style="color:${rlLevel};font-weight:700">${rl.level}</span>（风险分 ${rl.score}）</div>
     <table style="margin-top:8px"><tr><th>风险层</th><th>状态</th><th>数据日期</th><th>说明</th></tr>
     ${rl.layers.map(l=>`<tr><td><b>${l.name}</b></td>
       <td style="white-space:nowrap">${rlIco[l.status]||''} ${l.status}</td>
@@ -1246,6 +1499,7 @@ async function doDeep(code){
     box.className='card';
     box.innerHTML=`
     <div class="logo-t">深度分析报告 · ${d.name}（${d.code}）<span class="muted"> ｜ 生成于 ${d.time} ｜ Markdown 已存至 ${d.report_file.split('/').slice(-2).join('/')}</span></div>
+    ${d.one_line?`<div style="margin:8px 0;padding:8px 14px;background:#eef3ff;border-radius:8px;font-weight:600">📌 结论速览：${d.one_line}</div>`:''}
     ${hd?`
     <div style="border-left:4px solid ${hdColor};padding:10px 14px;margin:10px 0;background:var(--bg2,rgba(0,0,0,.03));border-radius:0 8px 8px 0">
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
@@ -1272,11 +1526,13 @@ async function doDeep(code){
   }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
 }
 
+let lastScreen=null,lastFunnel=null;
 async function runScreen(st){  const box=$('#screenResult');
   box.className='card loading';box.textContent='正在全市场初筛…（首次需加载全部A股快照，约10~30秒）';
   try{
     const r=await fetch('/api/screen?strategy='+st);const d=await r.json();
     if(d.error){box.className='card warn';box.textContent='✗ '+d.error;return}
+    lastScreen={st,stocks:d.stocks};
     const names={qarp:'价值成长 QARP',dividend:'高股息',lowpos:'深度回调'};
     const rows=d.stocks.map((s,i)=>`<tr style="cursor:pointer" onclick="pick('${s.code}','${s.name}')">
       <td>${i+1}</td><td>${s.name}</td><td class="muted">${s.code}</td>
@@ -1285,9 +1541,19 @@ async function runScreen(st){  const box=$('#screenResult');
       <td>${pct(s.chg60)}</td><td>${pct(s.ytd)}</td></tr>`).join('');
     box.className='card';
     box.innerHTML=`<div class="logo-t">${names[st]} 初筛 · 共 ${d.count} 只，显示前 ${d.stocks.length}（点击任意行进入逐股扫描）</div>
-    <table><tr><th>#</th><th>名称</th><th>代码</th><th>现价</th><th>PE</th><th>PB</th><th>股息率</th><th>市值</th><th>60日</th><th>YTD</th></tr>${rows}</table>`;
+    <div class="searchbar" style="margin:8px 0">
+      <button onclick="batchScore(lastScreen.stocks.slice(0,10).map(s=>s.code),'screenBatch','${names[st]} 初筛Top10')">⚡ 批量精评 Top10（逐股扫描+评分排序）</button>
+      <button onclick="exportScreenCsv()">导出 CSV</button>
+    </div>
+    <div id="screenBatch"></div>
+    <table><tr><th>#</th><th>名称</th><th>代码</th><th>现价</th><th>PE</th><th>PB</th><th>股息率</th><th>市值</th><th>60日</th><th>YTD</th></tr>${rows}</table>
+    <p class="muted" style="margin-top:8px">*初筛仅基于快照指标。「批量精评」会对前10只逐股拉取财务/K线并按综合评分重排——这是选出最终名单的关键一步。*</p>`;
   }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
 }
+function exportScreenCsv(){if(!lastScreen)return;
+  dlCSV(`初筛_${lastScreen.st}_${new Date().toISOString().slice(0,10)}.csv`,
+    ['代码','名称','现价','PE','PB','股息率%','市值亿','60日%','YTD%'],
+    lastScreen.stocks.map(s=>[s.code,s.name,s.price,s.pe,s.pb,s.dy,s['mktcap亿'],s.chg60,s.ytd]))}
 
 async function runFunnel(){
   const st=$('#fStrat').value, n=$('#fN').value;
@@ -1308,20 +1574,27 @@ async function runFunnel(){
       </div>`;
     }).join('');
     const names={composite:'综合策略',qarp:'QARP价值成长',dividend:'高股息',lowpos:'深度回调'};
+    lastFunnel=d;
     const rows=d.finals.map((f,i)=>`<tr style="cursor:pointer" onclick="pick('${f.code}','${f.name}')">
       <td>${i+1}</td><td><b>${f.name}</b><div class="muted">${f.code}</div></td><td>${f.ind||'—'}</td>
       <td><b style="color:${f.total>=75?'#1a9c6b':(f.total>=60?'#2b5fd9':'#c98a1b')}">${f.total}</b> ${f.grade}</td>
       <td>${fmt(f.price)}</td><td>${fmt(f.pe,1)}</td><td>${fmt(f.dy)}%</td>
       <td>${fmt(f.roe,1)}%</td><td class="${(f.cfo||0)<0?'dn':''}">${fmt(f.cfo,3)}</td>
       <td>${f.kfyoy===null||f.kfyoy===undefined?'—':`<span class="${f.kfyoy<0?'dn':'up'}">${f.kfyoy>0?'+':''}${f.kfyoy}%</span>`}</td>
-      <td>${pct(f.dd)}</td><td>${pct(f.m60)}</td></tr>`).join('');
+      <td>${pct(f.dd)}</td><td>${pct(f.m60)}</td>
+      <td><button onclick="event.stopPropagation();doDeepDirect('${f.code}','${(f.name||'').replace(/'/g,'')}')">深度</button></td></tr>`).join('');
     box.className='card';
-    box.innerHTML=`<div class="logo-t">${names[st]} · ${d.source} · 候选 ${d.all_graded} 只参与终评，最终选出 ${d.finals.length} 只（点击行进入完整扫描）</div>
+    box.innerHTML=`<div class="logo-t">${names[st]} · ${d.source} · 候选 ${d.all_graded} 只参与终评，最终选出 ${d.finals.length} 只（点击行进入完整扫描，「深度」直达11层风险分析）</div>
       ${funnel}
-      <table style="margin-top:12px"><tr><th>#</th><th>标的</th><th>行业</th><th>评分</th><th>现价</th><th>PE</th><th>股息率</th><th>ROE</th><th>每股现金流</th><th>扣非YoY</th><th>距52周高点</th><th>60日</th></tr>${rows}</table>
-      <p class="muted" style="margin-top:10px">*漏斗结果仅供研究参考，不构成投资建议；建仓前请点击标的查看完整报告与触发价位。*</p>`;
+      <div class="searchbar" style="margin:12px 0 4px"><button onclick="exportFunnelCsv()">导出终选 CSV</button></div>
+      <table><tr><th>#</th><th>标的</th><th>行业</th><th>评分</th><th>现价</th><th>PE</th><th>股息率</th><th>ROE</th><th>每股现金流</th><th>扣非YoY</th><th>距52周高点</th><th>60日</th><th></th></tr>${rows}</table>
+      <p class="muted" style="margin-top:10px">*漏斗结果仅供研究参考，不构成投资建议；建仓前请点「深度」查看11层风险筛查与触发价位。*</p>`;
   }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
 }
+function exportFunnelCsv(){if(!lastFunnel)return;
+  dlCSV(`漏斗终选_${lastFunnel.strategy}_${new Date().toISOString().slice(0,10)}.csv`,
+    ['代码','名称','行业','评分','评级','现价','PE','股息率%','ROE%','每股现金流','扣非YoY%','距52周高点%','60日%'],
+    lastFunnel.finals.map(f=>[f.code,f.name,f.ind||'',f.total,f.grade,f.price,f.pe,f.dy,f.roe,f.cfo,f.kfyoy,f.dd,f.m60]))}
 </script>
 </body>
 </html>"""
@@ -1376,6 +1649,11 @@ class Handler(BaseHTTPRequestHandler):
                 d = deep_analysis(qs.get("code", [""])[0])
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(d, ensure_ascii=False))
+            elif u.path == "/api/batch":
+                codes = (qs.get("codes", [""])[0] or "").split(",")
+                res = batch_scan(codes)
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(res, ensure_ascii=False))
             elif u.path == "/api/screen":
                 st = qs.get("strategy", ["qarp"])[0]
                 if st not in ("qarp", "dividend", "lowpos"):
