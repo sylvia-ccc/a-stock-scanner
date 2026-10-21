@@ -195,16 +195,16 @@ def profit_analysis(f10rows):
             return None
 
     latest = f10rows[0]
-    lf = val(latest, "KCFJCXSYJLR")
-    lf = round(lf / 1e8, 2) if lf is not None else None   # 元 → 亿元
+    lf_raw = val(latest, "KCFJCXSYJLR")                       # 元(用于同比比率)
+    lf = round(lf_raw / 1e8, 2) if lf_raw is not None else None  # 亿元(仅展示)
     yoy = None
     ldate = str(latest.get("REPORT_DATE"))[:10]
     py = str(int(ldate[:4]) - 1) + ldate[4:]
     for r in f10rows:
         if str(r.get("REPORT_DATE"))[:10] == py:
-            pf = val(r, "KCFJCXSYJLR")
-            if pf not in (None, 0) and lf is not None:
-                yoy = round((lf / pf - 1) * 100, 1) if pf > 0 else (round((lf / abs(pf) - 1) * 100, 1) if lf > 0 else None)
+            pf = val(r, "KCFJCXSYJLR")                        # 元
+            if pf not in (None, 0) and lf_raw is not None:
+                yoy = round((lf_raw / pf - 1) * 100, 1) if pf > 0 else (round((lf_raw / abs(pf) - 1) * 100, 1) if lf_raw > 0 else None)
             break
     annuals = sorted(val(r, "KCFJCXSYJLR") for r in f10rows
                      if r.get("REPORT_TYPE") == "年报" and val(r, "KCFJCXSYJLR") is not None)
@@ -510,7 +510,204 @@ def build_decision(quote, tech, K, total, g):
             "levels": [{"label": l, "price": p, "note": n} for l, p, n in levels], "notes": notes}
 
 
-# ---------------- 个股深度分析(持仓视角 + 数据范围声明) ----------------
+# ---------------- 风险因子层(8层扫描, 补齐深度分析遗漏) ----------------
+
+def risk_layers(code, K, quote, earn=None):
+    """8层风险因子: 每层输出 {name, status: OK|WARN|RISK|NA, detail}
+    权重: RISK=3分, WARN=1分 → risk_level: 低(≤1)/中(2~3)/高(4~6)/极高(≥7)
+    注意: 形参 quote 为行情字典; URL编码用 _qquote, 避免遮蔽"""
+    from urllib.parse import quote as _qquote
+    layers = []
+
+    def num(r, k):
+        try:
+            v = float(r.get(k))
+            return v if v == v else None
+        except Exception:
+            return None
+
+    mkt, sfx, _ = ss.market(code)
+    scode = code + sfx
+
+    # L1 资产负债表质量: 应收/存货占比与增速 vs 营收增速
+    try:
+        d = _gj('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_DMSK_FN_BALANCE'
+                '&columns=ALL&pageSize=1&pageNumber=1&sortColumns=REPORT_DATE&sortTypes=-1&filter='
+                + _qquote(f'(SECURITY_CODE="{code}")'))
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        if rows:
+            r = rows[0]
+            ta = num(r, "TOTAL_ASSETS")
+            ar, inv = num(r, "ACCOUNTS_RECE"), num(r, "INVENTORY")
+            ar_g, inv_g = num(r, "ACCOUNTS_RECE_RATIO"), num(r, "INVENTORY_RATIO")
+            rd = str(r.get("REPORT_DATE"))[:10]
+            if ta and ar is not None:
+                ar_pct = ar / ta * 100
+                inv_pct = (inv / ta * 100) if inv is not None else None
+                rev_g = K.get("营收YoY")
+                msgs, st = [], "OK"
+                if ar_pct > 30:
+                    msgs.append(f"应收账款占总资产 {ar_pct:.0f}%（偏高,回款风险）"); st = "WARN"
+                if inv_pct is not None and inv_pct > 40:
+                    msgs.append(f"存货占总资产 {inv_pct:.0f}%（偏高,跌价风险）"); st = "WARN"
+                if ar_g is not None and rev_g is not None and ar_g > rev_g + 20 and ar_pct > 15:
+                    msgs.append(f"应收同比 +{ar_g:.0f}% 远超营收同比 +{rev_g:.0f}%（利润含水量预警）"); st = "RISK"
+                inv_txt = f"{inv_pct:.0f}%" if inv_pct is not None else "N/A"
+                layers.append({"name": "应收/存货质量", "status": st, "date": rd,
+                               "detail": "；".join(msgs) or f"应收占总资产 {ar_pct:.0f}%、存货 {inv_txt}（占比正常）"})
+            else:
+                layers.append({"name": "应收/存货质量", "status": "NA", "date": rd, "detail": "数据不可得"})
+        else:
+            layers.append({"name": "应收/存货质量", "status": "NA", "date": "", "detail": "接口无数据"})
+    except Exception as e:
+        layers.append({"name": "应收/存货质量", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+    time.sleep(0.4)
+
+    # L2 商誉: 商誉/净资产
+    try:
+        d = _gj('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_F10_FINANCE_GBALANCE'
+                '&columns=ALL&pageSize=1&pageNumber=1&sortColumns=REPORT_DATE&sortTypes=-1&filter='
+                + _qquote(f'(SECUCODE="{scode}")'))
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        if rows:
+            r = rows[0]
+            gw, eq = num(r, "GOODWILL"), num(r, "TOTAL_EQUITY")
+            rd = str(r.get("REPORT_DATE"))[:10]
+            if gw and eq:
+                pct_ = gw / eq * 100
+                st = "RISK" if pct_ > 20 else ("WARN" if pct_ > 10 else "OK")
+                layers.append({"name": "商誉减值", "status": st, "date": rd,
+                               "detail": f"商誉 {gw/1e8:.1f} 亿 / 净资产 {eq/1e8:.0f} 亿 = {pct_:.1f}%"
+                                         + ("（>20% 高危,一旦减值直接吞噬利润）" if st == "RISK" else
+                                            ("（>10% 需跟踪并购标的业绩承诺）" if st == "WARN" else "（占比安全）"))})
+            else:
+                layers.append({"name": "商誉减值", "status": "OK", "date": rd, "detail": "无商誉或商誉为零（无减值雷）"})
+        else:
+            layers.append({"name": "商誉减值", "status": "NA", "date": "", "detail": "接口无数据"})
+    except Exception as e:
+        layers.append({"name": "商誉减值", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+    time.sleep(0.4)
+
+    # L3 股权质押(数据可能滞后, 口径标注)
+    try:
+        d = _gj('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_CSDC_LIST'
+                '&columns=ALL&pageSize=1&pageNumber=1&sortColumns=TRADE_DATE&sortTypes=-1&filter='
+                + _qquote(f'(SECUCODE="{scode}")'))
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        if rows and num(rows[0], "PRAT") is not None:
+            r = rows[0]
+            prat = num(r, "PRAT")
+            rd = str(r.get("TRADE_DATE"))[:10]
+            st = "RISK" if prat > 40 else ("WARN" if prat > 20 else "OK")
+            layers.append({"name": "股权质押", "status": st, "date": rd,
+                           "detail": f"质押比例 {prat:.1f}%（数据日 {rd}，中国结算口径可能滞后）"
+                                     + ("（>40% 平仓/控制权风险）" if st == "RISK" else ("（>20% 需跟踪）" if st == "WARN" else ""))})
+        else:
+            layers.append({"name": "股权质押", "status": "OK", "date": "", "detail": "无有效质押记录（或数据滞后未收录）"})
+    except Exception as e:
+        layers.append({"name": "股权质押", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+    time.sleep(0.4)
+
+    # L4 股东户数(筹码集中度)
+    try:
+        d = _gj('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_HOLDERNUMLATEST'
+                '&columns=ALL&pageSize=1&pageNumber=1&filter=' + _qquote(f'(SECUCODE="{scode}")'))
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        if rows:
+            r = rows[0]
+            hn, pre, chg = num(r, "HOLDER_NUM"), num(r, "PRE_HOLDER_NUM"), num(r, "HOLDER_NUM_RATIO")
+            rd = str(r.get("END_DATE"))[:10]
+            if hn and pre and chg is not None:
+                st = "WARN" if chg > 15 else ("OK" if chg < -5 else "OK")
+                note = ("（户数大增=筹码分散,警惕主力派发）" if chg > 15 else
+                        ("（户数下降=筹码集中,主力吸筹或缩量）" if chg < -5 else "（筹码结构稳定）"))
+                layers.append({"name": "筹码集中度", "status": st, "date": rd,
+                               "detail": f"股东户数 {hn:,.0f} 户，环比 {chg:+.1f}%{note}"})
+            else:
+                layers.append({"name": "筹码集中度", "status": "NA", "date": rd, "detail": "户数变化数据不可得"})
+        else:
+            layers.append({"name": "筹码集中度", "status": "NA", "date": "", "detail": "接口无数据"})
+    except Exception as e:
+        layers.append({"name": "筹码集中度", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+    time.sleep(0.4)
+
+    # L5 大股东/高管减持(近90天)
+    try:
+        import datetime as _dt
+        d90 = (_dt.datetime.strptime(ss.TODAY, "%Y-%m-%d") - _dt.timedelta(days=90)).strftime("%Y-%m-%d")
+        d = _gj('https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=RPT_SHAREHOLDER_HOLDCHANGE'
+                '&columns=ALL&pageSize=10&pageNumber=1&sortColumns=CHANGE_DATE&sortTypes=-1&filter='
+                + _qquote(f'(SECUCODE="{scode}")(CHANGE_DATE>=\'{d90}\')'))
+        rows = ((d or {}).get("result") or {}).get("data") or []
+        if rows:
+            sells = [r for r in rows if (num(r, "CHANGE_NUM") or 0) < 0]
+            if sells:
+                names = "、".join(str(r.get("HOLDER_NAME"))[:10] for r in sells[:3])
+                layers.append({"name": "重要股东减持", "status": "WARN", "date": d90,
+                               "detail": f"近90天 {len(sells)} 笔减持（{names} 等），需查公告动机"})
+            else:
+                layers.append({"name": "重要股东减持", "status": "OK", "date": d90, "detail": "近90天无减持记录（有增持类变动）"})
+        else:
+            layers.append({"name": "重要股东减持", "status": "OK", "date": d90, "detail": "近90天无大股东/高管持股变动"})
+    except Exception as e:
+        layers.append({"name": "重要股东减持", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+    time.sleep(0.4)
+
+    # L6 毛利率趋势(同期可比: H1 vs 上年H1, FY vs 上年FY, 避免报告期季节性失真)
+    try:
+        gm = {e["日期"][:4] + ("-H1" if "-06-30" in e["日期"] else "-FY"): e.get("毛利率")
+              for e in (earn or []) if e.get("毛利率") is not None}
+        pairs = []
+        for y in {k[:4] for k in gm}:
+            if f"{y}-H1" in gm and f"{int(y)-1}-H1" in gm:
+                pairs.append((f"{y}中报", gm[f"{y}-H1"], gm[f"{int(y)-1}-H1"]))
+            if f"{y}-FY" in gm and f"{int(y)-1}-FY" in gm:
+                pairs.append((f"{y}年报", gm[f"{y}-FY"], gm[f"{int(y)-1}-FY"]))
+        if pairs:
+            worst = [(tag, cur - pre) for tag, cur, pre in pairs if cur - pre < -2]
+            latest_tag, latest_cur = pairs[0][0], pairs[0][1]
+            if worst:
+                t, dp = worst[0]
+                layers.append({"name": "毛利率趋势", "status": "WARN", "date": "",
+                               "detail": f"{t}毛利率同比下滑 {abs(dp):.1f}pct，竞争加剧或成本上行；共 {len(worst)} 期同比下滑超2pct（{'、'.join(x for x, _ in worst)}）"})
+            else:
+                layers.append({"name": "毛利率趋势", "status": "OK", "date": "",
+                               "detail": f"最新毛利率 {latest_cur:.1f}%（{latest_tag}），各期同比无连续恶化"})
+        else:
+            layers.append({"name": "毛利率趋势", "status": "NA", "date": "", "detail": "同期可比期数不足"})
+    except Exception as e:
+        layers.append({"name": "毛利率趋势", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+
+    # L7 营收-现金流背离
+    rev, cfo = K.get("营收YoY"), K.get("每股现金流")
+    if rev is not None and cfo is not None and rev > 20 and cfo < 0:
+        layers.append({"name": "营收-现金流背离", "status": "RISK", "date": "",
+                       "detail": f"营收 +{rev:.0f}% 高增但每股现金流 {cfo} 元为负（扩张失血,利润未回款,Q3财报必须验证）"})
+    elif cfo is not None and cfo < 0:
+        layers.append({"name": "营收-现金流背离", "status": "WARN", "date": "",
+                       "detail": f"每股经营现金流 {cfo} 元为负（利润未转化为现金）"})
+    else:
+        layers.append({"name": "营收-现金流背离", "status": "OK", "date": "",
+                       "detail": f"每股经营现金流 {cfo} 元" + ("，与营收匹配" if rev is not None else "")})
+
+    # L8 流动性(换手率/成交活跃度)
+    try:
+        to = quote.get("换手率")
+        if to is not None:
+            st = "WARN" if to < 0.3 else "OK"
+            layers.append({"name": "交易流动性", "status": st, "date": "",
+                           "detail": f"换手率 {to:.2f}%" + ("（<0.3% 成交萎缩,大资金进出困难）" if st == "WARN" else "（流动性正常）")})
+        else:
+            layers.append({"name": "交易流动性", "status": "NA", "date": "", "detail": "换手率数据不可得"})
+    except Exception as e:
+        layers.append({"name": "交易流动性", "status": "NA", "date": "", "detail": f"核验异常:{type(e).__name__}"})
+
+    score = sum(3 if l["status"] == "RISK" else (1 if l["status"] == "WARN" else 0) for l in layers)
+    level = "低" if score <= 1 else ("中" if score <= 3 else ("高" if score <= 6 else "极高"))
+    return {"layers": layers, "score": score, "level": level}
+
+
+
 
 def _kline_with_source(code, mkt):
     """K线三级源(带来源标记): 腾讯fqkline(前复权) → 新浪日K(不复权)"""
@@ -527,11 +724,11 @@ def _kline_with_source(code, mkt):
     return closes, dates, "腾讯 fqkline（前复权）"
 
 
-def build_holding_decision(quote, tech, K, total, g):
+def build_holding_decision(quote, tech, K, total, g, risk_block=False):
     """持仓视角三态决策: 持有(hold)/加仓(add)/弃仓(exit), 与 build_decision 的未持仓买入视角互补。
     规则透明可复算:
       弃仓 = 任一硬伤命中: ①亏损且净利同比恶化 ②评分<45(D级) ③扣非YoY≤-30%且60日≤-15%(双杀) ④距顶回撤≥50%且创新低路径
-      加仓 = 无硬伤 且 非亏损 且 评级A/B 且 60日企稳(≥-5%) 且 现金流非负或扣非增长
+      加仓 = 无硬伤 且 非亏损 且 评级A/B 且 60日企稳(≥-5%) 且 现金流非负或扣非增长 且 无RISK级风险因子(risk_block)
       持有 = 其余: 给出「转加仓」与「转弃仓」双向触发价位
     """
     price = quote.get("现价")
@@ -553,17 +750,20 @@ def build_holding_decision(quote, tech, K, total, g):
     add2 = round(max(price * 0.85, lo * 1.02), 2)
 
     exit_reasons = []
+    fundamental_bad = (loss and (npy is not None and npy < 0)) or (kf is not None and kf <= -30)
     if loss and (npy is not None and npy < 0):
         exit_reasons.append(f"当期亏损且同比恶化（净利YoY {npy:+.1f}%）")
-    if total < 45:
-        exit_reasons.append(f"综合评分 {total} < 45（D级，多项基本面不达标）")
+    if total < 45 and fundamental_bad:
+        exit_reasons.append(f"综合评分 {total} < 45 且基本面恶化（亏损/扣非大降），多项不达标")
+    elif total < 45:
+        pass  # 纯位置拉低的D级(基本面无恶化)不走弃仓, 由持有态给双向触发
     if kf is not None and kf <= -30 and m60 <= -15:
         exit_reasons.append(f"扣非同比 {kf:+.1f}% 恶化 + 60日 {m60:+.1f}% 下跌，基本面技术面双杀")
     if dd <= -50 and falling:
         exit_reasons.append(f"距52周高点 {dd:.1f}% 深度回撤且仍在创新低路径")
 
     can_add = (not exit_reasons and not loss and (g.startswith("A") or g.startswith("B"))
-               and stable and (cfo is None or cfo >= 0 or (kf or 0) > 0))
+               and stable and (cfo is None or cfo >= 0 or (kf or 0) > 0) and not risk_block)
 
     notes_common = ["价位口径：与建仓决策一致（52周区间反推），以收盘价确认触发",
                     "财报窗口：正式财报落地后所有决策需重估，避开财报日博弈",
@@ -574,7 +774,7 @@ def build_holding_decision(quote, tech, K, total, g):
         notes_common.insert(0, "⚠ 周期顶部风险：年度扣非处近10年高位且同比回落——减仓评估区应提前执行")
 
     if exit_reasons:
-        full_exit = len(exit_reasons) >= 2 or total < 45
+        full_exit = len(exit_reasons) >= 2 or (total < 45 and fundamental_bad)
         action, color = ("弃仓(清仓)", "red") if full_exit else ("弃仓(减半)", "red")
         summary = ("命中硬伤：" + "；".join(exit_reasons) + "。"
                    + ("多项硬伤叠加，建议清仓离场，回收资金转配评分更高的标的。" if full_exit
@@ -604,7 +804,8 @@ def build_holding_decision(quote, tech, K, total, g):
     up = f"转「加仓」：收盘站稳 {ma20}（20日线）且 60日动量转正" + ("，或财报确认现金流转正" if (cfo or 0) < 0 else "")
     down = f"转「弃仓」：收盘跌破 {stop}（52周低点×0.97），或财报出现新增硬伤（亏损/扣非大幅恶化/解禁冲击）"
     summary = (f"评分{total}({g.strip()})、60日{m60:+.1f}%，处于「可持有但不满足加仓标准」的中间态："
-               f"{'尚在下跌通道，等右侧信号' if falling else '评级未达加仓线，等评分或动量改善'}。")
+               f"{'尚在下跌通道，等右侧信号' if falling else '评级未达加仓线，等评分或动量改善'}"
+               + ("；另有RISK级风险因子未解除（见风险筛查表），暂缓加仓" if risk_block else "") + "。")
     levels = [("转加仓触发", ma20, "站稳20日线+动量转正→按加仓规则分批"),
               ("加仓预备档(激进)", add1, "不愿等右侧者：接近52周低点5%上方小批补，仓位≤1/4"),
               ("转弃仓红线", stop, "收盘跌破无条件离场，不等反弹"),
@@ -634,8 +835,11 @@ def _build_data_range(quote, dates, closes, ksrc, earn, divs, lifts, f10_n):
          "口径": "按方案公告日；分红年数取近5年窗口"},
         {"项": "限售解禁", "来源": "东财解禁时间表", "覆盖": "未来 3 个月",
          "口径": "免费接口，大宗交易/询价转让减持未包含"},
-        {"项": "商誉/质押/股东户数", "来源": "-", "覆盖": "[MISSING]",
-         "口径": "免费接口未覆盖，重大决策前请人工核对最近公告"},
+        {"项": "资产负债表结构", "来源": "东财资产负债表摘要", "覆盖": "最新报告期",
+         "口径": "应收/存货占总资产比及同比增速，用于利润含水量判断"},
+        {"项": "商誉/质押/户数/减持", "来源": "东财F10资产负债表·中结算·股东变动",
+         "覆盖": "最新可得期（质押数据可能滞后）",
+         "口径": "商誉/净资产比、质押比例、股东户数环比、近90天减持记录；审计意见/大宗减持未覆盖"},
     ]
 
 
@@ -651,8 +855,17 @@ def deep_analysis(code):
     mkt, sfx, _ = ss.market(c)
     closes, dates, ksrc = _kline_with_source(c, mkt)
     K = {**base["key"], "扣非YoY": base.get("kfyoy"), "周期分位": base.get("cycle")}
-    hd = build_holding_decision(base["quote"], base["tech"], K, base["total"], base["grade"])
+    rl = risk_layers(c, K, base["quote"], earn=base["earn"])
+    risk_block = any(l["status"] == "RISK" for l in rl["layers"])
+    hd = build_holding_decision(base["quote"], base["tech"], K, base["total"], base["grade"], risk_block=risk_block)
     dr = _build_data_range(base["quote"], dates, closes, ksrc, base["earn"], base["divs"], base["lifts"], 44)
+    # 高风险因子注入持仓决策注释
+    if hd:
+        for l in rl["layers"]:
+            if l["status"] == "RISK":
+                hd["notes"].append(f"🔴 风险扫描[{l['name']}]：{l['detail']}")
+            elif l["status"] == "WARN":
+                hd["notes"].append(f"⚠ 风险扫描[{l['name']}]：{l['detail']}")
 
     # ---- Markdown 报告 ----
     name, q = base["name"], base["quote"]
@@ -689,7 +902,12 @@ def deep_analysis(code):
               "| 动作 | 价位 | 说明 |", "|---|---|---|"]
         L += [f"| {l['label']} | {l['price'] if l['price'] is not None else '—'} | {l['note']} |" for l in hd["levels"]]
         L += [""] + [f"- {n}" for n in hd["notes"]]
-    L += ["", "## 六、专家意见与风险清单", ""] + base["opinion"]
+    L += ["", "## 六、风险因子逐层筛查（8层）", "",
+          f"**综合风险等级：{rl['level']}（风险分 {rl['score']}，RISK=3分/WARN=1分）**", "",
+          "| 风险层 | 状态 | 数据日期 | 说明 |", "|---|---|---|---|"]
+    st_ico = {"OK": "✅", "WARN": "⚠️", "RISK": "🔴", "NA": "—"}
+    L += [f"| {l['name']} | {st_ico[l['status']]} {l['status']} | {l['date'] or '—'} | {l['detail']} |" for l in rl["layers"]]
+    L += ["", "## 七、专家意见与风险清单", ""] + base["opinion"]
     L += ["", "---",
           "*本报告由开源工具 a-stock-scanner 自动生成，全部数据来自公开免费接口，仅供研究参考，不构成投资建议。"
           "评分与决策基于数据范围声明所列快照，正式财报披露后应重新运行。*", ""]
@@ -700,6 +918,7 @@ def deep_analysis(code):
 
     base["holding_decision"] = hd
     base["data_range"] = dr
+    base["risk_layers"] = rl
     base["kline_source"] = ksrc
     base["kline_span"] = f"{dates[0]} ~ {dates[-1]}"
     base["report_file"] = md_path
@@ -1013,6 +1232,17 @@ async function doDeep(code){
     const hdColor=hd?{green:'#1a9c6b',orange:'#c98a1b',gold:'#8a7a1b',red:'#d63a3a'}[hd.color]||'#5b6472':'#5b6472';
     const reasonHtml=(hd.reasons&&hd.reasons.length)?`<p style="margin:6px 0"><b>命中硬伤：</b>${hd.reasons.join('；')}</p>`:'';
     const drRows=d.data_range.map(r=>`<tr><td><b>${r['项']}</b></td><td class="muted">${r['来源']}</td><td>${r['覆盖']}</td><td class="muted" style="white-space:normal">${r['口径']}</td></tr>`).join('');
+    const rl=d.risk_layers;
+    const rlIco={OK:'✅',WARN:'⚠️',RISK:'🔴',NA:'—'};
+    const rlLevel=rl?{低:'#1a9c6b',中:'#c98a1b',高:'#d67a1b',极高:'#d63a3a'}[rl.level]||'#5b6472':'#5b6472';
+    const rlHtml=rl?`
+    <div class="logo-t" style="margin-top:14px">风险因子逐层筛查（8层）· 综合风险：<span style="color:${rlLevel};font-weight:700">${rl.level}</span>（风险分 ${rl.score}）</div>
+    <table style="margin-top:8px"><tr><th>风险层</th><th>状态</th><th>数据日期</th><th>说明</th></tr>
+    ${rl.layers.map(l=>`<tr><td><b>${l.name}</b></td>
+      <td style="white-space:nowrap">${rlIco[l.status]||''} ${l.status}</td>
+      <td class="muted">${l.date||'—'}</td>
+      <td class="muted" style="white-space:normal">${l.detail}</td></tr>`).join('')}</table>`
+    :'';
     box.className='card';
     box.innerHTML=`
     <div class="logo-t">深度分析报告 · ${d.name}（${d.code}）<span class="muted"> ｜ 生成于 ${d.time} ｜ Markdown 已存至 ${d.report_file.split('/').slice(-2).join('/')}</span></div>
@@ -1036,6 +1266,7 @@ async function doDeep(code){
     </div>
     <div class="logo-t" style="margin-top:14px">数据范围声明（所有结论仅在下述范围内有效）</div>
     <table style="margin-top:8px"><tr><th>数据项</th><th>来源</th><th>覆盖范围</th><th>口径备注</th></tr>${drRows}</table>
+    ${rlHtml}
     <p class="muted" style="margin-top:10px">完整报告（六大章节：数据范围/评分/基本面/技术面/持仓决策/风险清单）已保存为 Markdown 文件，可直接分享或归档。</p>`
     :'<p class="warn">持仓决策不可用（行情或K线数据不足）</p>'}`;
   }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
