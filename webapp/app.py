@@ -1359,6 +1359,7 @@ th{color:var(--sub);font-weight:500;font-size:12px}
     <button data-tab="screen">策略选股</button>
     <button data-tab="funnel">多轮漏斗选股</button>
     <button data-tab="watch">自选清单</button>
+    <button data-tab="hold">持仓体检</button>
     <button data-tab="logic">选股逻辑</button>
   </div>
 
@@ -1414,6 +1415,27 @@ th{color:var(--sub);font-weight:500;font-size:12px}
       </div>
       <div id="wlBatch"></div>
       <div id="wlList" style="margin-top:10px"></div>
+    </div>
+  </div>
+
+  <div id="tab-hold" style="display:none">
+    <div class="card">
+      <div class="logo-t">持仓体检 · 一次性扫描全部持仓，低分/高风险自动置顶</div>
+      <p class="muted" style="margin:8px 0 0;line-height:1.8">
+        用法：把持仓列表的<b>文字</b>粘贴到下面（券商App持仓页复制 / 截图后用微信或QQ「提取文字」再粘贴 / 直接输入代码均可），
+        点「提取持仓标的」自动识别，确认无误后一键体检。识别依据全A名称+6位代码，误识别可点 × 移除。</p>
+      <textarea id="holdText" placeholder="示例（任意格式均可）：
+中科曙光 1200股 603019
+神火股份 000933
+贵州茅台 600519 …"
+        style="width:100%;min-height:110px;margin-top:10px;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit;background:var(--bg2,rgba(0,0,0,.02))"></textarea>
+      <div class="searchbar" style="margin-top:8px">
+        <button onclick="parseHolding()">🔍 提取持仓标的</button>
+        <button onclick="startHealth()" id="holdGo" style="display:none">⚡ 开始体检</button>
+        <button onclick="exportHoldCsv()" id="holdCsv" style="display:none">导出 CSV</button>
+      </div>
+      <div id="holdChips" style="margin-top:8px"></div>
+      <div id="holdResult" style="margin-top:12px"></div>
     </div>
   </div>
 
@@ -1477,7 +1499,7 @@ let suggTimer=null,suggPick=false;
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');
-  ['scan','screen','funnel','watch','logic'].forEach(t=>$('#tab-'+t).style.display=t===b.dataset.tab?'':'none');
+  ['scan','screen','funnel','watch','hold','logic'].forEach(t=>$('#tab-'+t).style.display=t===b.dataset.tab?'':'none');
   if(b.dataset.tab==='watch')renderWL();
 });
 
@@ -1543,6 +1565,69 @@ async function batchScore(codes,boxId,label){
 }
 function exportWLCsv(){const l=wl();if(!l.length){toast('清单为空');return}
   dlCSV(`自选清单_${new Date().toISOString().slice(0,10)}.csv`,['代码','名称'],l.map(s=>[s.code,s.name]))}
+
+// ---------------- 持仓体检(文本→提取标的→批量扫描→低分置顶) ----------------
+let holdStocks=[];
+async function parseHolding(){
+  const text=$('#holdText').value.trim();
+  if(!text){toast('请先粘贴持仓文字或输入代码');return}
+  const box=$('#holdChips');
+  box.innerHTML='<span class="muted">识别中…</span>';
+  try{
+    const r=await fetch('/api/parse',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text})});
+    const d=await r.json();
+    if(d.error){box.innerHTML=`<span class="warn">✗ ${d.error}</span>`;return}
+    holdStocks=d.stocks||[];
+    renderChips();
+  }catch(e){box.innerHTML=`<span class="warn">请求失败：${e}</span>`}
+}
+function renderChips(){
+  const box=$('#holdChips');
+  if(!holdStocks.length){box.innerHTML='<span class="warn">未识别到A股标的：请确认文字中包含股票名称或6位代码</span>';$('#holdGo').style.display='none';return}
+  box.innerHTML=`<div class="muted" style="margin-bottom:6px">识别到 <b>${holdStocks.length}</b> 只（点 × 可移除误识别项）：</div>`+
+    holdStocks.map((s,i)=>`<span style="display:inline-flex;align-items:center;gap:6px;background:var(--bg2,rgba(0,0,0,.04));border:1px solid var(--line);border-radius:16px;padding:4px 12px;margin:2px 6px 2px 0;font-size:13px">
+      <b>${s.name}</b> <span class="muted">${s.code}</span>
+      <span onclick="holdStocks.splice(${i},1);renderChips()" style="cursor:pointer;color:#d63a3a;font-weight:700">×</span></span>`).join('');
+  $('#holdGo').style.display='';
+}
+async function startHealth(){
+  if(!holdStocks.length)return;
+  const box=$('#holdResult');
+  box.className='card loading';box.style.display='';
+  box.innerHTML=`持仓体检中… ${holdStocks.length} 只逐股扫描（约 ${Math.ceil(holdStocks.length*0.08)}~${Math.ceil(holdStocks.length*0.15)} 分钟）`;
+  $('#holdCsv').style.display='none';
+  try{
+    const r=await fetch('/api/batch?codes='+holdStocks.map(s=>s.code).join(','));
+    const d=await r.json();
+    if(d.error||!d.stocks.length){box.className='card warn';box.textContent='✗ '+(d.error||'无可评标的');return}
+    const stocks=d.stocks.slice().sort((a,b)=>a.total-b.total); // 低分在前=最需处理在前
+    const lv=t=>(t.total<45||t.action==='回避')?['🔴 优先处理','#d63a3a']:((t.total<60||['等待','观察'].includes(t.action))?['🟡 跟踪观察','#c98a1b']:['🟢 健康','#1a9c6b']);
+    const nR=stocks.filter(s=>lv(s)[0].startsWith('🔴')).length,nY=stocks.filter(s=>lv(s)[0].startsWith('🟡')).length,nG=stocks.length-nR-nY;
+    lastHold=stocks;
+    $('#holdCsv').style.display='';
+    box.className='card';
+    box.innerHTML=`
+    <div class="logo-t">体检结果 · ${stocks.length} 只持仓：<span style="color:#1a9c6b">🟢健康 ${nG}</span> ｜ <span style="color:#c98a1b">🟡跟踪 ${nY}</span> ｜ <span style="color:#d63a3a">🔴优先处理 ${nR}</span></div>
+    ${nR?`<div style="margin:8px 0;padding:10px 14px;background:#fdecec;border-radius:8px;font-weight:600;color:#b3261e">⚠ ${nR} 只持仓评分偏低/建议回避，已置顶——逐只点「深度」查看11层风险与持仓三态决策（卖出/减仓触发价）</div>`:''}
+    <table><tr><th>#</th><th>体检</th><th>标的</th><th>评分</th><th>建议</th><th>现价</th><th>PE</th><th>ROE</th><th>营收YoY</th><th>现金流</th><th>扣非YoY</th><th>距52周高</th><th>60日</th><th></th></tr>
+    ${stocks.map((f,i)=>{const[c,cl]=lv(f);return `<tr style="cursor:pointer" onclick="doScan('${f.code}');switchTab('scan')">
+      <td>${i+1}</td><td><b style="color:${cl}">${c}</b></td>
+      <td><b>${f.name}</b><div class="muted">${f.code}${f.ind?' · '+f.ind:''}</div></td>
+      <td><b style="color:${f.total>=75?'#1a9c6b':(f.total>=60?'#2b5fd9':(f.total>=45?'#c98a1b':'#d63a3a'))}">${f.total}</b> ${f.grade}</td>
+      <td><span class="tag">${f.action||'—'}</span></td>
+      <td>${fmt(f.price)}</td><td>${fmt(f.pe,1)}</td><td>${fmt(f.roe,1)}%</td>
+      <td>${pct(f.rev)}</td><td class="${(f.cfo||0)<0?'dn':''}">${fmt(f.cfo,3)}</td>
+      <td>${f.kfyoy===null||f.kfyoy===undefined?'—':`<span class="${f.kfyoy<0?'dn':'up'}">${f.kfyoy>0?'+':''}${f.kfyoy}%</span>`}</td>
+      <td>${pct(f.dd)}</td><td>${pct(f.m60)}</td>
+      <td><button onclick="event.stopPropagation();doDeepDirect('${f.code}','${(f.name||'').replace(/'/g,'')}')">深度</button></td></tr>`}).join('')}</table>
+    <p class="muted" style="margin-top:8px">*体检=逐股完整扫描(评分+建仓决策)，🔴个股务必点「深度」做持仓三态决策后再操作；本工具不构成投资建议。*</p>`;
+  }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
+}
+let lastHold=null;
+function exportHoldCsv(){if(!lastHold)return;
+  dlCSV(`持仓体检_${new Date().toISOString().slice(0,10)}.csv`,
+    ['代码','名称','行业','评分','评级','建议','现价','PE','ROE%','营收YoY%','每股现金流','扣非YoY%','距52周高点%','60日%'],
+    lastHold.map(f=>[f.code,f.name,f.ind||'',f.total,f.grade,f.action||'',f.price,f.pe,f.roe,f.rev,f.cfo,f.kfyoy,f.dd,f.m60]))}
 
 const qEl=$('#q'),suggEl=$('#sugg');
 qEl.addEventListener('input',()=>{clearTimeout(suggTimer);const v=qEl.value.trim();if(v.length<1){suggEl.style.display='none';return}suggTimer=setTimeout(()=>search(v),200)});
@@ -1809,6 +1894,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def do_POST(self):
+        u = urlparse(self.path)
+        try:
+            if u.path == "/api/parse":
+                n = int(self.headers.get("Content-Length") or 0)
+                body = {}
+                if n:
+                    body = json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+                res = parse_holding_text(body.get("text", ""))
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps({"count": len(res), "stocks": res}, ensure_ascii=False))
+            else:
+                self._send(404, "text/plain", "not found")
+        except Exception as e:
+            try:
+                self._send(500, "application/json; charset=utf-8", json.dumps({"error": str(e)}, ensure_ascii=False))
+            except Exception:
+                pass
+
     def do_GET(self):
         u = urlparse(self.path)
         qs = parse_qs(u.query)
@@ -1865,6 +1969,49 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(500, "application/json; charset=utf-8", json.dumps({"error": str(e)}, ensure_ascii=False))
             except Exception:
                 pass
+
+
+def parse_holding_text(text):
+    """从任意文本(券商持仓文字/截图OCR结果/手打代码)提取A股标的。
+    双通道: ①全A名称匹配(长名优先, 占位去重叠) ②6位数字代码(限全A列表内存在, 防日期金额误提取)"""
+    text = text or ""
+    if len(text) > 20000:
+        text = text[:20000]
+    stocks = fetch_all_stocks() or []
+    used = [False] * (len(text) + 1)
+    found = []
+
+    def mark(i, ln):
+        for j in range(i, min(i + ln, len(used))):
+            used[j] = True
+
+    def free(i, ln):
+        return not any(used[i:i + ln])
+
+    # ① 名称匹配: 长名优先(避免"平安"抢先占用"中国平安")
+    for s in sorted([s for s in stocks if len(s.get("name") or "") >= 2],
+                    key=lambda x: -len(x["name"])):
+        nm = s["name"]
+        start = 0
+        while True:
+            i = text.find(nm, start)
+            if i < 0:
+                break
+            if free(i, len(nm)):
+                mark(i, len(nm))
+                found.append({"code": s["code"], "name": nm, "via": "名称"})
+            start = i + len(nm)
+    # ② 6位数字代码: 必须存在于全A列表(排除日期/金额/单号)
+    seen = {f["code"] for f in found}
+    for m in re.finditer(r"(?<!\d)(\d{6})(?!\d)", text):
+        c = m.group(1)
+        if c in seen:
+            continue
+        s = next((s for s in stocks if s["code"] == c), None)
+        if s:
+            found.append({"code": c, "name": s["name"], "via": "代码"})
+            seen.add(c)
+    return found
 
 
 if __name__ == "__main__":
