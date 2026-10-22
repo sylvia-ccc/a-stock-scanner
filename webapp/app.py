@@ -1091,6 +1091,419 @@ def _build_data_range(quote, dates, closes, ksrc, earn, divs, lifts, f10_n):
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output")
 
 
+# ---------------- 专业数据面板(机构视角: 估值分位/财务质量/资金筹码/技术指标) ----------------
+
+def _dc_rows(report, filter_expr, order="REPORT_DATE", n=6, retry=2):
+    """东财数据中心通用取数(免费公开接口)"""
+    url = ("https://datacenter-web.eastmoney.com/api/data/v1/get?reportName=" + report +
+           "&columns=ALL&pageSize=" + str(n) + "&pageNumber=1&sortColumns=" + order +
+           "&sortTypes=-1&filter=" + quote(filter_expr))
+    d = _gj(url, retry=retry)
+    return ((d or {}).get("result") or {}).get("data") or []
+
+
+def _pct_rank(cur, hist):
+    """当前值在历史序列中的分位(0~100)"""
+    v = [x for x in hist if isinstance(x, (int, float)) and x == x]
+    if cur is None or not isinstance(cur, (int, float)) or cur != cur or len(v) < 30:
+        return None
+    return round(100 * sum(1 for x in v if x <= cur) / len(v))
+
+
+def _ema(vals, n):
+    k, e = 2 / (n + 1), [vals[0]]
+    for v in vals[1:]:
+        e.append(v * k + e[-1] * (1 - k))
+    return e
+
+
+def _rsi14(closes):
+    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    up, dn = [max(d, 0) for d in diffs[-60:]], [max(-d, 0) for d in diffs[-60:]]
+    if len(dn) < 15:
+        return None
+    au, ad = sum(up[:14]) / 14, sum(dn[:14]) / 14
+    for i in range(14, len(up)):
+        au = (au * 13 + up[i]) / 14
+        ad = (ad * 13 + dn[i]) / 14
+    return round(100, 1) if ad == 0 else round(100 - 100 / (1 + au / ad), 1)
+
+
+def _macd(closes):
+    if len(closes) < 40:
+        return None
+    dif = [a - b for a, b in zip(_ema(closes, 12), _ema(closes, 26))]
+    dea = _ema(dif, 9)
+    st = ("金叉" if dif[-2] <= dea[-2] and dif[-1] > dea[-1] else
+          ("死叉" if dif[-2] >= dea[-2] and dif[-1] < dea[-1] else
+           ("零轴上多头" if dif[-1] > 0 else "零轴下空头")))
+    return {"DIF": round(dif[-1], 3), "DEA": round(dea[-1], 3), "BAR": round(dif[-1] - dea[-1], 3), "state": st}
+
+
+def _tech_panel(closes, dates, tech):
+    """收盘价口径专业指标: MACD/RSI/BOLL/均线排列/波动率/相对上证"""
+    n = len(closes)
+    out = {}
+    m = _macd(closes)
+    if m:
+        out["MACD"] = f"{m['state']}（DIF {m['DIF']} / DEA {m['DEA']} / 柱 {m['BAR']}）"
+    r = _rsi14(closes)
+    if r is not None:
+        out["RSI14"] = f"{r}" + ("（超买区>70）" if r > 70 else ("（超卖区<30）" if r < 30 else ""))
+    if n >= 25:
+        ma20 = sum(closes[-20:]) / 20
+        sd = (sum((x - ma20) ** 2 for x in closes[-20:]) / 20) ** 0.5
+        if sd > 0:
+            out["BOLL20"] = f"中轨 {ma20:.2f}，价格处 {(closes[-1] - (ma20 - 2 * sd)) / (4 * sd) * 100:.0f}% 通道位"
+    if n >= 121:
+        ma5, ma20 = sum(closes[-5:]) / 5, sum(closes[-20:]) / 20
+        ma60, ma120 = sum(closes[-60:]) / 60, sum(closes[-120:]) / 120
+        arr = ("多头排列" if ma5 > ma20 > ma60 > ma120 else ("空头排列" if ma5 < ma20 < ma60 < ma120 else "均线纠缠"))
+        out["均线排列"] = f"{arr}（MA5 {ma5:.2f} / MA20 {ma20:.2f} / MA60 {ma60:.2f} / MA120 {ma120:.2f}）"
+    if n >= 22:
+        rets = [closes[i] / closes[i - 1] - 1 for i in range(n - 20, n)]
+        mu = sum(rets) / len(rets)
+        vol = (sum((x - mu) ** 2 for x in rets) / len(rets)) ** 0.5 * (244 ** 0.5) * 100
+        out["20日年化波动率"] = f"{vol:.0f}%" + ("（高波动）" if vol > 60 else "")
+    # 相对上证: 60日超额收益 + 120日贝塔
+    try:
+        ic, idt = ss.fetch_kline("000001", "sh")
+        if len(ic) >= 61 and n >= 61:
+            ex60 = (closes[-1] / closes[-61] - 1) * 100 - (ic[-1] / ic[-61] - 1) * 100
+            out["60日相对上证"] = f"{ex60:+.1f}pct（{'跑赢大盘' if ex60 > 0 else '跑输大盘'}）"
+            if len(ic) >= 121 and n >= 121:
+                rs = [closes[i] / closes[i - 1] - 1 for i in range(n - 120, n)]
+                ri = [ic[i] / ic[i - 1] - 1 for i in range(len(ic) - 120, len(ic))]
+                mi, mii = sum(rs) / 120, sum(ri) / 120
+                cov = sum((rs[i] - mi) * (ri[i] - mii) for i in range(120)) / 120
+                vi = sum((x - mii) ** 2 for x in ri) / 120
+                if vi > 0:
+                    b = cov / vi
+                    bl = ("与大盘阶段性背离（负相关）" if b < 0 else
+                          ("弹性大于大盘" if b > 1.1 else ("弹性小于大盘" if b < 0.9 else "与大盘同步")))
+                    out["120日贝塔"] = f"{b:.2f}（{bl}）"
+    except Exception:
+        pass
+    return out
+
+
+def _valuation_pro(code, ind_bench=None):
+    """估值历史分位(约3年窗口): PE-TTM/PB/PS + 行业PE中位对比"""
+    try:
+        rows = _dc_rows("RPT_VALUEANALYSIS_DET", f'(SECURITY_CODE="{code}")', order="TRADE_DATE", n=760)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    cur = rows[0]
+    pes = [r.get("PE_TTM") for r in rows]
+    pbs = [r.get("PB_MRQ") for r in rows]
+    pe = cur.get("PE_TTM")
+    vp = [x for x in pes if isinstance(x, (int, float)) and x == x and x > 0]
+    out = {
+        "date": str(cur.get("TRADE_DATE"))[:10],
+        "PE_TTM": pe, "PB": cur.get("PB_MRQ"), "PS": cur.get("PS_TTM"), "PCF": cur.get("PCF_OCF_TTM"),
+        "PEG": cur.get("PEG_CAR"),
+        "mktcap亿": round(cur["TOTAL_MARKET_CAP"] / 1e8) if cur.get("TOTAL_MARKET_CAP") else None,
+        "pe_pct": _pct_rank(pe, pes), "pb_pct": _pct_rank(cur.get("PB_MRQ"), pbs),
+        "window_years": round(len(rows) / 244, 1),
+        "pe_med": round(sorted(vp)[len(vp) // 2], 1) if len(vp) >= 30 else None,
+    }
+    if isinstance(ind_bench, dict) and ind_bench.get("pe_med") is not None:
+        out["行业PE中位"] = ind_bench["pe_med"]
+    return out
+
+
+def _quality_pro(f10_latest, sfx):
+    """财务质量: 负债率/流动性/盈利质量(现金流/净利)/商誉占比"""
+    if not f10_latest:
+        return None
+    q = {"报告期": f10_latest.get("REPORT_DATE"),
+         "资产负债率%": f10_latest.get("ZCFZL"), "流动比率": f10_latest.get("LD"), "速动比率": f10_latest.get("SD"),
+         "净利率%": f10_latest.get("XSJLL"), "ROE加权%": f10_latest.get("ROEJQ")}
+    eps, ocf = f10_latest.get("EPSJB"), f10_latest.get("MGJYXJJE")
+    q["现金流/净利"] = round(ocf / eps, 2) if eps and eps > 0 and ocf is not None else None
+    # 商誉: F10资产负债表(公司类型4→1逐个试, 银行/保险用不同模板)
+    try:
+        d = str(f10_latest.get("REPORT_DATE") or "")
+        row = None
+        for ct in ("4", "3", "2", "1"):
+            url = ("https://emweb.securities.eastmoney.com/PC_HSF10/NewFinanceAnalysis/zcfzbAjaxNew"
+                   "?companyType=" + ct + "&reportDateType=0&reportType=1&dates=" + d +
+                   "&code=" + sfx.strip("."))
+            try:
+                dd = _gj(url, retry=1)
+                rows = dd.get("data") or []
+                if rows and rows[0].get("TOTAL_ASSETS"):
+                    row = rows[0]
+                    break
+            except Exception:
+                continue
+        if row:
+            gw, ta = row.get("GOODWILL"), row.get("TOTAL_ASSETS")
+            q["商誉亿"] = round(gw / 1e8, 2) if gw else 0
+            q["商誉/总资产%"] = round(gw / ta * 100, 1) if gw and ta else 0
+    except Exception:
+        pass
+    return q
+
+
+def _fundflow_today(code):
+    """兜底: push2 单日主力净流入(历史日kline接口不稳时)"""
+    try:
+        secid = ("1." if code.startswith(("6", "9", "5")) else "0.") + code
+        url = ("https://push2.eastmoney.com/api/qt/stock/get?secid=" + secid +
+               "&fields=f62,f184&invt=2&fltt=2")
+        d = _gj(url, retry=2)
+        data = (d or {}).get("data") or {}
+        if data.get("f62") is not None:
+            f184 = data.get("f184")
+            return {"今日净流入亿": round(data["f62"] / 1e8, 2),
+                    "今日净占比%": round(f184, 1) if isinstance(f184, (int, float)) else f184}
+    except Exception:
+        pass
+    return None
+
+
+def _fundflow_pro(code):
+    """主力资金近30日: 5/10日净流入合计、连续流出天数、最新净占比"""
+    rows = []
+    try:
+        secid = ("1." if code.startswith(("6", "9", "5")) else "0.") + code
+        url = ("https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?lmt=0&klt=101&secid=" +
+               secid + "&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56,f57")
+        d = _gj(url, retry=3, timeout=25)
+        kl = ((d or {}).get("data") or {}).get("klines") or []
+    except Exception:
+        kl = []
+    for s in kl[-30:]:
+        p = s.split(",")
+        if len(p) >= 7:  # f51日期,f52主力,f53小单,f54中单,f55大单,f56超大单,f57主力净占比
+            try:
+                rows.append((p[0], float(p[1]), float(p[6])))
+            except ValueError:
+                pass
+    if not rows:
+        t = _fundflow_today(code)
+        if t:
+            return {"最新净流入亿": t["今日净流入亿"], "最新净占比%": t["今日净占比%"],
+                    "note": "历史口径暂不可用，仅今日数据"}
+        return None
+    main = [r[1] for r in rows]
+    out_days = 0
+    for v in reversed(main):
+        if v < 0:
+            out_days += 1
+        else:
+            break
+    return {
+        "最新净流入亿": round(main[-1] / 1e8, 2),
+        "最新净占比%": round(rows[-1][2], 1),
+        "5日合计亿": round(sum(main[-5:]) / 1e8, 2),
+        "10日合计亿": round(sum(main[-10:]) / 1e8, 2),
+        "连续流出天数": out_days if main[-1] < 0 else 0,
+        "日期": rows[-1][0],
+    }
+
+
+def _margin_pro(code):
+    """融资余额与5日变化(无两融标的返回None)"""
+    try:
+        rows = _dc_rows("RPTA_WEB_RZRQ_GGMX", f'(SCODE="{code}")', order="DATE", n=6)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    y = [r.get("RZYE") for r in rows if r.get("RZYE") is not None]
+    chg = round((y[0] / y[4] - 1) * 100, 2) if len(y) >= 5 and y[4] else None
+    return {"融资余额亿": round(rows[0]["RZYE"] / 1e8, 1), "5日变化%": chg, "日期": str(rows[0].get("DATE"))[:10]}
+
+
+def _holders_pro(code):
+    """股东户数(最新一期): 户数/增减/户均市值"""
+    try:
+        rows = _dc_rows("RPT_HOLDERNUMLATEST", f'(SECURITY_CODE="{code}")', order="END_DATE", n=2)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    r = rows[0]
+    return {"截止日": str(r.get("END_DATE"))[:10], "股东户数": r.get("HOLDER_NUM"),
+            "较上期%": r.get("HOLDER_NUM_RATIO"), "户均持股万元": round(r.get("AVG_MARKET_CAP") / 1e4, 1) if r.get("AVG_MARKET_CAP") else None,
+            "户均持股数": round(r.get("AVG_HOLD_NUM")) if r.get("AVG_HOLD_NUM") else None}
+
+
+def _lhb_pro(code):
+    """龙虎榜(近180日): 次数/累计净买入/最近上榜"""
+    try:
+        rows = _dc_rows("RPT_DAILYBILLBOARD_DETAILSNEW", f'(SECURITY_CODE="{code}")', order="TRADE_DATE", n=12)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    rows.sort(key=lambda r: str(r.get("TRADE_DATE")), reverse=True)
+    import datetime
+    cut = (datetime.date.today() - datetime.timedelta(days=180)).isoformat()
+    recent = [r for r in rows if str(r.get("TRADE_DATE"))[:10] >= cut]
+    if not recent:
+        return {"上榜次数": 0, "note": "近180日无龙虎榜记录"}
+    net = sum(r.get("BILLBOARD_NET_AMT") or 0 for r in recent)
+    return {"上榜次数": len(recent), "累计净买亿": round(net / 1e8, 2),
+            "最近": f"{str(recent[0]['TRADE_DATE'])[:10]} {recent[0].get('EXPLANATION','')}"}
+
+
+def pro_analysis(code, sfx, quote, tech, closes, dates, f10_latest, ind, ind_bench=None):
+    """汇总专业数据面板 + 专业结论(各维度 积极/中性/谨慎 + 总体研判)"""
+    pro = {"ind": ind}
+    val = _valuation_pro(code, ind_bench)
+    if val:
+        pro["valuation"] = val
+    q = _quality_pro(f10_latest, sfx)
+    if q:
+        q.pop("_sfx", None)
+        pro["quality"] = q
+    ff = _fundflow_pro(code)
+    if ff:
+        pro["fundflow"] = ff
+    mg = _margin_pro(code)
+    if mg:
+        pro["margin"] = mg
+    hd = _holders_pro(code)
+    if hd:
+        pro["holders"] = hd
+    lhb = _lhb_pro(code)
+    if lhb:
+        pro["lhb"] = lhb
+    if len(closes) >= 40:
+        pro["tech_panel"] = _tech_panel(closes, dates, tech)
+    pro["verdicts"] = pro_verdict(pro)
+    return pro
+
+
+def pro_verdict(pro):
+    """专业结论: 估值/盈利质量/资金/筹码/技术 各维度给出 积极/中性/谨慎"""
+    vs = []
+
+    def add(dim, tag, text):
+        vs.append({"dim": dim, "tag": tag, "text": text})
+
+    v = pro.get("valuation")
+    if v and v.get("PE_TTM"):
+        p = v.get("pe_pct")
+        base_txt = f"PE-TTM {v['PE_TTM']:.1f}"
+        if v.get("PB"):
+            base_txt += f"，PB {v['PB']:.1f}" + (f"（{v['pb_pct']}%分位）" if v.get("pb_pct") is not None else "")
+        if v.get("行业PE中位"):
+            base_txt += f"，行业PE中位 {v['行业PE中位']}"
+        if p is None:
+            add("估值", "中性", base_txt + "；历史窗口不足，分位不可比")
+        elif p <= 25:
+            add("估值", "积极", base_txt + f"；处近{v['window_years']}年 {p}% 低分位，安全边际相对充足")
+        elif p >= 80:
+            add("估值", "谨慎", base_txt + f"；处近{v['window_years']}年 {p}% 高分位，已计入较多乐观预期")
+        else:
+            add("估值", "中性", base_txt + f"；处近{v['window_years']}年 {p}% 分位，估值合理")
+    q = pro.get("quality")
+    if q:
+        tag, txt = "中性", ""
+        zcf, cfr = q.get("资产负债率%"), q.get("现金流/净利")
+        gw = q.get("商誉/总资产%")
+        if zcf is not None and zcf > 70 and not any(t in (pro.get("ind") or "") for t in ("银行", "证券", "保险", "非银")):
+            tag, txt = "谨慎", f"资产负债率 {zcf:.0f}% 偏高"
+        elif zcf is not None:
+            txt = f"资产负债率 {zcf:.0f}%"
+        if cfr is not None:
+            if cfr >= 0.8:
+                tag = "积极" if tag != "谨慎" else tag
+                txt += f"；经营现金流/净利 {cfr}，盈利含金量高"
+            elif cfr < 0.5:
+                tag = "谨慎"
+                txt += f"；经营现金流/净利仅 {cfr}，利润未有效转化为现金"
+            else:
+                txt += f"；现金流/净利 {cfr}，正常水平"
+        if gw is not None and gw >= 30:
+            tag = "谨慎"
+            txt += f"；商誉占总资产 {gw}%，减值风险需重点跟踪"
+        elif gw is not None and gw > 0:
+            txt += f"；商誉占总资产 {gw}%"
+        add("盈利质量", tag, txt.strip("；") or "财务指标正常")
+    ff = pro.get("fundflow")
+    if ff:
+        m5, days = ff.get("5日合计亿"), ff.get("连续流出天数") or 0
+        if m5 is None:
+            cur = ff.get("最新净流入亿")
+            if cur is not None:
+                tag = "积极" if cur > 0.3 else ("谨慎" if cur < -0.3 else "中性")
+                add("主力资金", tag, f"今日主力净流入 {cur} 亿（占成交 {ff.get('最新净占比%')}%）；多日口径暂缺")
+        elif m5 > 0.5:
+            add("主力资金", "积极", f"近5日主力净流入 {m5} 亿（10日 {ff.get('10日合计亿')} 亿），资金持续关注")
+        elif m5 < -0.5 and days >= 5:
+            add("主力资金", "谨慎", f"近5日主力净流出 {m5} 亿且已连续流出 {days} 日，筹码松动迹象")
+        elif m5 < -0.5:
+            add("主力资金", "谨慎", f"近5日主力净流出 {m5} 亿，短期资金面偏弱")
+        else:
+            add("主力资金", "中性", f"近5日主力资金进出平衡（{m5} 亿）")
+    mg = pro.get("margin")
+    if mg:
+        chg = mg.get("5日变化%")
+        if chg is None:
+            add("杠杆资金", "中性", f"融资余额 {mg.get('融资余额亿')} 亿，变化平稳")
+        elif chg > 5:
+            add("杠杆资金", "谨慎", f"融资余额 {mg.get('融资余额亿')} 亿，5日增 {chg}%，杠杆情绪升温，波动或放大")
+        elif chg < -5:
+            add("杠杆资金", "中性", f"融资余额 {mg.get('融资余额亿')} 亿，5日降 {chg}%，杠杆资金退潮")
+        else:
+            add("杠杆资金", "中性", f"融资余额 {mg.get('融资余额亿')} 亿，5日 {chg:+}%，平稳")
+    h = pro.get("holders")
+    if h and h.get("较上期%") is not None:
+        r = h["较上期%"]
+        if r <= -3:
+            add("筹码结构", "积极", f"股东户数 {r:+.1f}%（{h['截止日']}），筹码趋于集中；户均 {h.get('户均持股万元')} 万元")
+        elif r >= 10:
+            add("筹码结构", "谨慎", f"股东户数 {r:+.1f}%（{h['截止日']}），筹码明显分散，拉升阻力增大")
+        else:
+            add("筹码结构", "中性", f"股东户数 {r:+.1f}%（{h['截止日']}），结构稳定")
+    t = pro.get("tech_panel") or {}
+    if t:
+        tag, txt = "中性", []
+        macd, arr = str(t.get("MACD", "")), str(t.get("均线排列", ""))
+        if "金叉" in macd or "多头排列" in arr:
+            tag = "积极"
+            if "多头排列" in arr:
+                txt.append("均线多头排列")
+            if "金叉" in macd:
+                txt.append("MACD金叉")
+            if "零轴上" in macd and "金叉" not in macd:
+                txt.append("DIF运行于零轴上方")
+        elif "死叉" in macd or "空头排列" in arr:
+            tag = "谨慎"
+            if "空头排列" in arr:
+                txt.append("均线空头排列")
+            if "死叉" in macd:
+                txt.append("MACD死叉")
+        else:
+            txt.append(macd.split("（")[0] or "技术指标中性")
+        if "超买" in str(t.get("RSI14", "")):
+            txt.append("RSI超买，短线追高风险大")
+        elif "超卖" in str(t.get("RSI14", "")):
+            txt.append("RSI超卖，存在技术性反弹需求")
+        if "高波动" in str(t.get("20日年化波动率", "")):
+            txt.append("波动率高，仓位宜保守")
+        add("技术动能", tag, "；".join(txt))
+    pos = sum(1 for x in vs if x["tag"] == "积极")
+    neg = sum(1 for x in vs if x["tag"] == "谨慎")
+    if pos - neg >= 2:
+        stance = "多维积极信号共振，机构视角整体偏多，可按计划分批参与"
+    elif neg - pos >= 2:
+        stance = "多维风险信号共振，机构视角偏防御，建议观望或降低敞口"
+    elif pos and neg:
+        stance = "多空信号交织，关键看资金面与技术面的方向确认，控制单笔仓位"
+    else:
+        stance = "整体中性，按既有决策框架执行即可"
+    return {"list": vs, "stance": stance,
+            "count": {"积极": pos, "中性": sum(1 for x in vs if x["tag"] == "中性"), "谨慎": neg}}
+
+
 def deep_analysis(code, fresh=False):
     """个股深度分析: 复用 scan_json 全量数据 → 持仓三态决策 + 数据范围声明 + Markdown 报告落盘"""
     key = "deep:" + re.sub(r"\D", "", code or "")
@@ -1119,6 +1532,15 @@ def _deep_impl(code):
     risk_block = any(l["status"] == "RISK" for l in rl["layers"])
     hd = build_holding_decision(base["quote"], base["tech"], K, base["total"], base["grade"], risk_block=risk_block)
     dr = _build_data_range(base["quote"], dates, closes, ksrc, base["earn"], base["divs"], base["lifts"], 44)
+    dr += [
+        {"项": "估值历史分位", "来源": "东财数据中心", "覆盖": "近3年日线", "口径": "PE-TTM/PB分位为窗口内静态排名"},
+        {"项": "财务质量指标", "来源": "东财F10主要指标/资产负债表", "覆盖": "最新报告期", "口径": "负债率/流动比/现金流净利比/商誉占比"},
+        {"项": "主力资金流向", "来源": "东财行情接口", "覆盖": "近30个交易日", "口径": "主力=大单+超大单净额(逐笔推算)"},
+        {"项": "融资融券", "来源": "东财数据中心", "覆盖": "最新6期", "口径": "融资余额(不含融券)；无两融标的为空"},
+        {"项": "股东户数", "来源": "东财数据中心", "覆盖": "最新一期", "口径": "披露滞后约半个月"},
+        {"项": "龙虎榜", "来源": "东财数据中心", "覆盖": "近180日", "口径": "上榜日席位买卖净额累计"},
+        {"项": "专业技术指标", "来源": "本地计算", "覆盖": "全量K线", "口径": "MACD/RSI14/BOLL/均线排列/贝塔·收盘价口径"},
+    ]
     # 高风险因子注入持仓决策注释
     if hd:
         for l in rl["layers"]:
@@ -1138,6 +1560,15 @@ def _deep_impl(code):
         one_line = " · ".join(parts)
     else:
         one_line = None
+
+    # ---- 专业数据面板(机构视角) ----
+    sup_ind = (base.get("support") or {}).get("industry") or {}
+    try:
+        pro = pro_analysis(c, sfx, base["quote"], base["tech"], closes, dates,
+                           base.get("f10_latest"), ind, ind_bench=sup_ind)
+    except Exception:
+        pro = {}
+    base["pro"] = pro
 
     # ---- Markdown 报告 ----
     name, q = base["name"], base["quote"]
@@ -1199,7 +1630,71 @@ def _deep_impl(code):
         if sup.get("calendar"):
             L += ["", "| 日期 | 事件 | 提示 |", "|---|---|---|"]
             L += [f"| {c['date']} | {c['event']} | {c['note']} |" for c in sup["calendar"]]
-    L += ["", "## 八、专家意见与风险清单", ""] + base["opinion"]
+
+    def _pp(x, suf=""):
+        if x is None:
+            return "—"
+        if isinstance(x, float):
+            x = round(x, 2)
+        return f"{x}{suf}"
+
+    if pro:
+        L += ["", "## 八、专业数据面板（机构视角）", ""]
+        v = pro.get("valuation")
+        if v:
+            L += [f"### 8.1 估值与历史分位（近 {v.get('window_years', '3')} 年窗口，截至 {v.get('date')}）", "",
+                  "| 指标 | 当前值 | 历史分位 | 参考基准 |", "|---|---|---|---|"]
+            L.append(f"| PE-TTM | {_pp(v.get('PE_TTM'))} | {_pp(v.get('pe_pct'), '%')} | 历史中位 {_pp(v.get('pe_med'))}；行业PE中位 {_pp(v.get('行业PE中位'))} |")
+            L.append(f"| PB | {_pp(v.get('PB'))} | {_pp(v.get('pb_pct'), '%')} | — |")
+            L.append(f"| PS-TTM | {_pp(v.get('PS'))} | — | — |")
+            L.append(f"| PCF-TTM | {_pp(v.get('PCF'))} | — | 总市值 {_pp(v.get('mktcap亿'), ' 亿')} |")
+            if v.get("PEG") and 0 < v["PEG"] < 10:
+                L.append(f"| PEG | {_pp(v.get('PEG'))} | — | <1 通常视为成长与估值匹配 |")
+        q = pro.get("quality")
+        if q:
+            L += [f"### 8.2 财务质量（报告期 {q.get('报告期')}）", "",
+                  "| 指标 | 数值 | 专业含义 |", "|---|---|---|"]
+            meaning = {"资产负债率%": ">70%偏高(金融股除外)", "流动比率": ">1.5流动性充足", "速动比率": ">1短期偿债稳",
+                       "净利率%": "盈利能力核心", "ROE加权%": ">15%为优质公司门槛", "现金流/净利": ">0.8盈利含金量高", "商誉/总资产%": ">30%减值风险"}
+            for k in ("资产负债率%", "流动比率", "速动比率", "净利率%", "ROE加权%", "现金流/净利", "商誉/总资产%"):
+                if q.get(k) is not None:
+                    L.append(f"| {k} | {_pp(q.get(k))} | {meaning.get(k, '—')} |")
+        ff, mg, h, lhb = pro.get("fundflow"), pro.get("margin"), pro.get("holders"), pro.get("lhb")
+        if ff or mg or h or lhb:
+            L += ["### 8.3 资金面与筹码结构", "", "| 维度 | 数据 | 解读 |", "|---|---|---|"]
+            if ff:
+                if ff.get("5日合计亿") is not None:
+                    L.append(f"| 主力资金 | 近5日 {_pp(ff.get('5日合计亿'))} 亿 / 近10日 {_pp(ff.get('10日合计亿'))} 亿 / 最新占比 {_pp(ff.get('最新净占比%'), '%')} | "
+                             + (f"连续流出 {ff.get('连续流出天数')} 日" if ff.get("连续流出天数") else "最新一日净流入 " + str(ff.get('最新净流入亿')) + " 亿") + " |")
+                else:
+                    L.append(f"| 主力资金 | 今日 {_pp(ff.get('最新净流入亿'))} 亿（占成交 {_pp(ff.get('最新净占比%'), '%')}） | {ff.get('note', '')} |")
+            if mg:
+                L.append(f"| 融资余额 | {mg.get('融资余额亿')} 亿（5日 {_pp(mg.get('5日变化%'), '%')}）| 杠杆资金情绪 |")
+            if h:
+                L.append(f"| 股东户数 | {_pp(h.get('股东户数'))} 户（{h.get('截止日')}，较上期 {_pp(h.get('较上期%'), '%')}）| "
+                         + ("户数降=筹码集中" if (h.get("较上期%") or 0) < 0 else "户数升=筹码分散") + f"；户均 {_pp(h.get('户均持股万元'), ' 万')} |")
+            if lhb:
+                if lhb.get("上榜次数"):
+                    L.append(f"| 龙虎榜 | 近180日上榜 {lhb['上榜次数']} 次，累计净买 {_pp(lhb.get('累计净买亿'))} 亿 | {lhb.get('最近', '')} |")
+                else:
+                    L.append(f"| 龙虎榜 | 近180日无上榜 | 非游资炒作型标的 |")
+        tp = pro.get("tech_panel")
+        if tp:
+            L += ["### 8.4 专业技术指标（收盘价口径）", "", "| 指标 | 读数 |", "|---|---|"]
+            L += [f"| {k} | {val_} |" for k, val_ in tp.items()]
+        vd = pro.get("verdicts") or {}
+        if vd.get("list"):
+            L += ["", "## 九、专业结论（机构视角研判）", ""]
+            ico = {"积极": "🟢 积极", "中性": "⚪ 中性", "谨慎": "🟠 谨慎"}
+            L += ["| 维度 | 评估 | 结论 |", "|---|---|---|"]
+            L += [f"| {x['dim']} | {ico[x['tag']]} | {x['text']} |" for x in vd["list"]]
+            cnt = vd.get("count") or {}
+            L += ["", f"**总体研判：{vd.get('stance')}**（积极 {cnt.get('积极', 0)} 项 / 中性 {cnt.get('中性', 0)} 项 / 谨慎 {cnt.get('谨慎', 0)} 项）"]
+            if hd:
+                L.append(f"结合前文三态决策「{hd['action']}」与风险等级「{rl['level']}」："
+                         + ("决策与专业面板方向一致，可执行既定价位计划。" if cnt.get("谨慎", 0) <= 1
+                            else "存在多项谨慎信号，执行决策时应降低单笔金额、严守止损。"))
+    L += ["", "## 十、专家意见与风险清单", ""] + base["opinion"]
     L += ["", "---",
           "*本报告由开源工具 a-stock-scanner 自动生成，全部数据来自公开免费接口，仅供研究参考，不构成投资建议。"
           "评分与决策基于数据范围声明所列快照，正式财报披露后应重新运行。*", ""]
@@ -1307,6 +1802,17 @@ def _scan_json_impl(code):
     S, K = ss.score_all(earn, tech, quote, divs, lifts)
     f10 = fetch_f10(code, sfx)
     pa = profit_analysis(f10)
+    # 专业面板用: 最新一期主要财务指标
+    f10_latest = None
+    if f10:
+        r0 = f10[0]
+        f10_latest = {"REPORT_DATE": str(r0.get("REPORT_DATE"))[:10]}
+        for k in ("EPSJB", "MGJYXJJE", "XSJLL", "ZCFZL", "LD", "SD", "ROEJQ"):
+            try:
+                v = r0.get(k)
+                f10_latest[k] = float(v) if v not in (None, "-", "") else None
+            except (TypeError, ValueError):
+                f10_latest[k] = None
     cyc = (pa or {}).get("周期分位")
     kfyoy = (pa or {}).get("扣非YoY")
     K["周期分位"] = cyc
@@ -1343,6 +1849,7 @@ def _scan_json_impl(code):
         "support": support,
         "key": {k: K.get(k) for k in ["ROE", "毛利率", "营收YoY", "净利YoY", "每股现金流", "PE", "PEG", "分红年数", "股息率", "亏损", "周期分位"]},
         "kf": (pa or {}).get("扣非最新"), "kfyoy": (pa or {}).get("扣非YoY"), "cycle": cyc,
+        "f10_latest": f10_latest,
         "opinion": op_lines, "profit_trend": trend, "time": ss.TODAY,
     }
     _archive_signal(base)
@@ -1525,7 +2032,7 @@ th{color:var(--sub);font-weight:500;font-size:12px}
 <body>
 <div class="wrap">
   <h1>A股全景扫描</h1>
-  <div class="sub">数据源：腾讯行情 · 东财数据中心 ｜ 评分 = 盈利20+成长20+财务15+估值15+位置15+回报10−风险扣分 ｜ 深度分析含 11 层风险筛查 ｜ 仅供研究参考</div>
+  <div class="sub">数据源：腾讯行情 · 东财数据中心 ｜ 评分 = 盈利20+成长20+财务15+估值15+位置15+回报10−风险扣分 ｜ 深度分析含 11 层风险筛查 + 机构级专业面板（估值分位/财务质量/资金筹码/技术指标）｜ 仅供研究参考</div>
 
   <div class="tabs">
     <button class="on" data-tab="scan">个股扫描</button>
@@ -1968,7 +2475,7 @@ async function doDeep(code, fresh){
   const box=$('#deepBox');
   box.style.display='';
   box.className='card loading';
-  box.innerHTML='深度分析中…（在扫描数据基础上追加F10扣非/持仓三态决策/报告生成，约8~15秒）';
+  box.innerHTML='深度分析中…（扫描+财务核验+专业数据面板+报告生成，约10~25秒）';
   box.scrollIntoView({behavior:'smooth',block:'start'});
   try{
     const r=await fetch('/api/deep?code='+code+(fresh?'&fresh=1':''));const d=await r.json();
@@ -1988,6 +2495,47 @@ async function doDeep(code, fresh){
       <td class="muted">${l.date||'—'}</td>
       <td class="muted" style="white-space:normal">${l.detail}</td></tr>`).join('')}</table>`
     :'';
+    // 专业数据面板(机构视角)
+    let proHtml='';
+    const pr=d.pro;
+    if(pr&&pr.verdicts){
+      const tc={积极:'#1a9c6b',中性:'#5b6472',谨慎:'#d67a1b'};
+      const vdRows=pr.verdicts.list.map(x=>`<tr><td><b>${x.dim}</b></td>
+        <td style="white-space:nowrap"><span style="color:${tc[x.tag]||'#5b6472'};font-weight:700">${x.tag==='积极'?'🟢 ':x.tag==='谨慎'?'🟠 ':'⚪ '}${x.tag}</span></td>
+        <td class="muted" style="white-space:normal">${x.text}</td></tr>`).join('');
+      const cnt=pr.verdicts.count||{};
+      const pctBar=p=>p===null||p===undefined?'':`<span style="display:inline-block;width:64px;height:7px;background:#edf0f4;border-radius:4px;overflow:hidden;vertical-align:middle;margin-left:6px"><span style="display:block;height:100%;width:${Math.min(p,100)}%;background:${p<=25?'#1a9c6b':p>=80?'#d63a3a':'#c98a1b'}"></span></span>`;
+      const v=pr.valuation,q=pr.quality,ff=pr.fundflow,mg=pr.margin,h=pr.holders,lhb=pr.lhb,tp=pr.tech_panel;
+      const tr3=(a,b,c)=>`<tr><td>${a}</td><td><b>${b}</b></td><td class="muted" style="white-space:normal">${c}</td></tr>`;
+      let valRows='',qRows='',fRows='',tRows='';
+      if(v){
+        const f1=x=>(x===null||x===undefined)?'—':Number(x).toFixed(1), f2=x=>(x===null||x===undefined)?'—':Number(x).toFixed(2);
+        valRows=tr3('PE-TTM',f1(v.PE_TTM),`3年分位 ${v.pe_pct??'—'}%${pctBar(v.pe_pct)} ｜ 历史中位 ${f1(v.pe_med)}${v['行业PE中位']?` ｜ 行业中位 ${f1(v['行业PE中位'])}`:''}`)
+              + tr3('PB',f2(v.PB),`3年分位 ${v.pb_pct??'—'}%${pctBar(v.pb_pct)}`)
+              + tr3('PS-TTM / PCF-TTM',`${f2(v.PS)} / ${f2(v.PCF)}`,(v.PEG>0&&v.PEG<10)?`PEG ${f2(v.PEG)}（<1 成长与估值匹配）`:'')
+              + tr3('总市值',v['mktcap亿']?v['mktcap亿']+' 亿':'—',`估值窗口截至 ${v.date}`);
+      }
+      if(q){
+        qRows=tr3('资产负债率',q['资产负债率%']!=null?q['资产负债率%'].toFixed(1)+'%':'—','>70% 偏高（金融股除外）')
+            + tr3('流动 / 速动比率',`${q['流动比率']!=null?Number(q['流动比率']).toFixed(2):'—'} / ${q['速动比率']!=null?Number(q['速动比率']).toFixed(2):'—'}`,'>1.5 / >1 短期偿债稳健')
+            + tr3('净利率 / ROE加权',`${q['净利率%']!=null?q['净利率%'].toFixed(1)+'%':'—'} / ${q['ROE加权%']!=null?q['ROE加权%']+'%':'—'}`,'ROE>15% 为优质公司门槛')
+            + tr3('现金流/净利',q['现金流/净利']??'—','>0.8 盈利含金量高；<0.5 警惕纸面利润')
+            + (q['商誉/总资产%']!=null?tr3('商誉',`${q['商誉亿']??0} 亿（占总资产 ${q['商誉/总资产%']}%）`,q['商誉/总资产%']>=30?'⚠️ 减值风险重点跟踪':'—'):'');
+      }
+      if(ff) fRows+=tr3('主力资金',`近5日 ${ff['5日合计亿']??'—'} 亿 ｜ 近10日 ${ff['10日合计亿']??'—'} 亿`,ff['连续流出天数']?`已连续流出 ${ff['连续流出天数']} 日 ｜ 最新净占比 ${ff['最新净占比%']}%`:`最新一日净流入 ${ff['最新净流入亿']} 亿（占成交 ${ff['最新净占比%']}%）${ff.note?' ⚠ '+ff.note:''}`);
+      if(mg) fRows+=tr3('融资余额',`${mg['融资余额亿']} 亿`,mg['5日变化%']!=null?`5日 ${mg['5日变化%']>=0?'+':''}${mg['5日变化%']}%，杠杆资金情绪`:'');
+      if(h) fRows+=tr3('股东户数',`${h['股东户数']??'—'} 户（${h['截止日']}）`,`较上期 ${Number(h['较上期%']).toFixed(1)}% → ${h['较上期%']<0?'筹码集中':'筹码分散'} ｜ 户均 ${h['户均持股万元']??'—'} 万元`);
+      if(lhb) fRows+=tr3('龙虎榜',`近180日 ${lhb['上榜次数']} 次`,lhb['上榜次数']?`累计净买 ${lhb['累计净买亿']} 亿 ｜ ${lhb['最近']||''}`:(lhb.note||''));
+      if(tp) tRows=Object.entries(tp).map(([k,x])=>tr3(k,x,'')).join('');
+      proHtml=`
+      <div class="logo-t" style="margin-top:16px">专业结论（机构视角）· 积极 ${cnt['积极']||0} / 中性 ${cnt['中性']||0} / 谨慎 ${cnt['谨慎']||0}</div>
+      <table style="margin-top:8px"><tr><th style="width:80px">维度</th><th style="width:70px">评估</th><th>结论</th></tr>${vdRows}</table>
+      <div style="margin:10px 0 4px;padding:8px 14px;background:#f5f7fa;border-left:4px solid #2b5fd9;border-radius:0 8px 8px 0;font-weight:600">🎯 总体研判：${pr.verdicts.stance}</div>
+      ${valRows?`<div class="logo-t" style="margin-top:14px">① 估值与历史分位</div><table style="margin-top:6px"><tr><th style="width:110px">指标</th><th style="width:130px">数值</th><th>分位与参考</th></tr>${valRows}</table>`:''}
+      ${qRows?`<div class="logo-t" style="margin-top:14px">② 财务质量（报告期 ${q['报告期']}）</div><table style="margin-top:6px"><tr><th style="width:110px">指标</th><th style="width:150px">数值</th><th>专业含义</th></tr>${qRows}</table>`:''}
+      ${fRows?`<div class="logo-t" style="margin-top:14px">③ 资金面与筹码结构</div><table style="margin-top:6px"><tr><th style="width:110px">维度</th><th style="width:280px">数据</th><th>解读</th></tr>${fRows}</table>`:''}
+      ${tRows?`<div class="logo-t" style="margin-top:14px">④ 专业技术指标</div><table style="margin-top:6px"><tr><th style="width:110px">指标</th><th>读数</th></tr>${tRows}</table>`:''}`;
+    }
     box.className='card';
     box.innerHTML=`
     <div class="logo-t">深度分析报告 · ${d.name}（${d.code}）<span class="muted"> ｜ 生成于 ${d.time} ｜ Markdown 已存至 ${d.report_file.split('/').slice(-2).join('/')}</span>
@@ -2014,7 +2562,8 @@ async function doDeep(code, fresh){
     <div class="logo-t" style="margin-top:14px">数据范围声明（所有结论仅在下述范围内有效）</div>
     <table style="margin-top:8px"><tr><th>数据项</th><th>来源</th><th>覆盖范围</th><th>口径备注</th></tr>${drRows}</table>
     ${rlHtml}
-    <p class="muted" style="margin-top:10px">完整报告（六大章节：数据范围/评分/基本面/技术面/持仓决策/风险清单）已保存为 Markdown 文件，可直接分享或归档。</p>`
+    ${proHtml}
+    <p class="muted" style="margin-top:10px">完整报告（十章：数据范围/评分/基本面/技术面/持仓决策/11层风险/决策支持/专业面板/专业结论/专家清单）已保存为 Markdown 文件，可直接分享或归档。</p>`
     :'<p class="warn">持仓决策不可用（行情或K线数据不足）</p>'}`;
   }catch(e){box.className='card warn';box.textContent='请求失败：'+e}
 }
