@@ -1853,12 +1853,14 @@ function pick(c,n){qEl.value=n+' '+c;suggEl.style.display='none';doScan(c)}
 function fmt(v,d=2){return (v===null||v===undefined||v==='-')?'—':Number(v).toFixed(d)}
 function pct(v){if(v===null||v===undefined||v==='-')return '—';const n=Number(v);const cls=n>0?'up':(n<0?'dn':'');return `<span class="${cls}">${n>0?'+':''}${n.toFixed(1)}%</span>`}
 
-async function doScan(code){
+let _lastScan='';
+async function doScan(code, fresh){
   code=(code||'').replace(/[^0-9]/g,'');
   if(!code)return;
+  _lastScan=code;
   $('#result').innerHTML='<div class="card loading">正在扫描 '+code+' …（拉取行情/K线/财务/分红/解禁，约5~10秒）</div>';
   try{
-    const r=await fetch('/api/scan?code='+code);const d=await r.json();
+    const r=await fetch('/api/scan?code='+code+(fresh?'&fresh=1':''));const d=await r.json();
     if(d.error){$('#result').innerHTML='<div class="card warn">✗ '+d.error+'</div>';return}
     render(d);
   }catch(e){$('#result').innerHTML='<div class="card warn">请求失败：'+e+'</div>'}
@@ -1923,7 +1925,8 @@ function render(d){
       <div class="gauge" style="background:${gc}"><div class="n">${d.total}</div><div class="g">${d.grade}</div></div>
       <div class="hero-r">
         <div class="nm">${d.name} <span class="muted">${d.code}</span> <span class="tag">${d.profit_trend}</span>${k.亏损?'<span class="tag warn">当期亏损</span>':''}${(d.cycle||0)>=0.9?(d.kfyoy||0)<0?`<span class="tag warn">⚠周期高位回落(分位${Math.round(d.cycle*100)}%)</span>`:`<span class="tag">利润创新高(分位${Math.round(d.cycle*100)}%)</span>`:''}
-          <button data-wlstar="${d.code}" onclick="toggleWL('${d.code}','${(d.name||'').replace(/'/g,'')}')" style="margin-left:8px;padding:3px 12px;border:1px solid var(--line);border-radius:14px;background:var(--card);cursor:pointer;font-size:12px">☆ 加自选</button></div>
+          <button data-wlstar="${d.code}" onclick="toggleWL('${d.code}','${(d.name||'').replace(/'/g,'')}')" style="margin-left:8px;padding:3px 12px;border:1px solid var(--line);border-radius:14px;background:var(--card);cursor:pointer;font-size:12px">☆ 加自选</button>
+          <button onclick="doScan(_lastScan,true)" title="绕过10分钟缓存, 拉取最新行情" style="margin-left:6px;padding:3px 12px;border:1px solid var(--line);border-radius:14px;background:var(--card);cursor:pointer;font-size:12px">🔄 最新重扫</button></div>
         <div class="px">现价 <b>${fmt(q.现价)}</b> ${pct(q['涨跌%'])}<span class="muted"> ｜ 总市值 ${fmt(q.总市值亿,0)}亿 ｜ 换手 ${fmt(q.换手率,2)}% ｜ ${d.time}</span></div>
         <div class="kv">
           <span>52周: ${fmt(t['52周低'])} ~ ${fmt(t['52周高'])}</span>
@@ -1961,14 +1964,14 @@ async function doDeepDirect(code,name){
   doDeep(code);
 }
 
-async function doDeep(code){
+async function doDeep(code, fresh){
   const box=$('#deepBox');
   box.style.display='';
   box.className='card loading';
   box.innerHTML='深度分析中…（在扫描数据基础上追加F10扣非/持仓三态决策/报告生成，约8~15秒）';
   box.scrollIntoView({behavior:'smooth',block:'start'});
   try{
-    const r=await fetch('/api/deep?code='+code);const d=await r.json();
+    const r=await fetch('/api/deep?code='+code+(fresh?'&fresh=1':''));const d=await r.json();
     if(d.error){box.className='card warn';box.textContent='✗ '+d.error;return}
     const hd=d.holding_decision;
     const hdColor=hd?{green:'#1a9c6b',orange:'#c98a1b',gold:'#8a7a1b',red:'#d63a3a'}[hd.color]||'#5b6472':'#5b6472';
@@ -1987,7 +1990,8 @@ async function doDeep(code){
     :'';
     box.className='card';
     box.innerHTML=`
-    <div class="logo-t">深度分析报告 · ${d.name}（${d.code}）<span class="muted"> ｜ 生成于 ${d.time} ｜ Markdown 已存至 ${d.report_file.split('/').slice(-2).join('/')}</span></div>
+    <div class="logo-t">深度分析报告 · ${d.name}（${d.code}）<span class="muted"> ｜ 生成于 ${d.time} ｜ Markdown 已存至 ${d.report_file.split('/').slice(-2).join('/')}</span>
+      <button onclick="doDeep(_lastScan,true)" title="绕过缓存并重扫最新行情后重新深度分析" style="margin-left:10px;padding:3px 12px;border:1px solid var(--line);border-radius:14px;background:var(--card);cursor:pointer;font-size:12px">🔄 最新重析</button></div>
     ${d.one_line?`<div style="margin:8px 0;padding:8px 14px;background:#eef3ff;border-radius:8px;font-weight:600">📌 结论速览：${d.one_line}</div>`:''}
     ${hd?`
     <div style="border-left:4px solid ${hdColor};padding:10px 14px;margin:10px 0;background:var(--bg2,rgba(0,0,0,.03));border-radius:0 8px 8px 0">
