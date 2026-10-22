@@ -1,0 +1,27 @@
+# Nginx 反代样例: A股全景扫描器
+# 用法: 修改 server_name 后, 拷贝到 /etc/nginx/conf.d/stock.conf, 然后
+#       sudo nginx -t && sudo systemctl reload nginx
+
+server {
+    listen 80;
+    server_name stock.example.com;          # ← 改成你的域名(或服务器公网IP)
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;    # 与 deploy.sh 的 PORT 一致
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_read_timeout 300s;             # 漏斗/批量体检单次请求可达数十秒
+    }
+
+    # ---- 可选: 口令保护(强烈建议公网使用) ----
+    # sudo apt install apache2-utils  (或 dnf install httpd-tools)
+    # sudo htpasswd -c /etc/nginx/.htpasswd yourname
+    # 然后取消下面两行注释:
+    # auth_basic "A-Stock Scanner";
+    # auth_basic_user_file /etc/nginx/.htpasswd;
+
+    # ---- 可选: 仅允许自己的IP访问 ----
+    # allow 1.2.3.4;        # ← 你的出口IP
+    # deny all;
+}

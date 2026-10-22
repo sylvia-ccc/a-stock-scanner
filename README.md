@@ -106,6 +106,23 @@ python3 webapp/app.py 8080
 python3 scripts/stock_scanner.py 603019 601012 600941
 ```
 
+### 部署到自己的服务器（Linux + systemd）
+
+```bash
+# 服务器上执行（需要 git + python3）
+git clone https://github.com/sylvia-ccc/a-stock-scanner.git
+cd a-stock-scanner
+sudo bash deploy/deploy.sh            # 反代模式: 仅监听 127.0.0.1, 用 Nginx 对外（推荐）
+# 或
+sudo bash deploy/deploy.sh public     # 直接暴露 0.0.0.0:8080（需放行安全组, 建议加口令保护）
+```
+
+- 自动注册 systemd 服务 `a-stock-scanner`（开机自启、崩溃自动重启）
+- 更新版本：`git pull && sudo systemctl restart a-stock-scanner`
+- 日志：`sudo journalctl -u a-stock-scanner -f`
+- Nginx 反代 + 口令保护/IP白名单样例见 `deploy/nginx.conf.example`（公网强烈建议开启 `auth_basic`）
+- 环境变量：`PORT`（端口，默认 8080）、`BIND`（监听地址，默认 0.0.0.0）
+
 ## 📐 项目结构
 
 ```
@@ -114,6 +131,9 @@ a-stock-scanner/
 │   └── stock_scanner.py   # 命令行扫描器（数据管道 + 评分引擎，可独立使用）
 ├── webapp/
 │   └── app.py             # 网页版（http.server，含漏斗选股与建仓决策）
+├── deploy/
+│   ├── deploy.sh          # 服务器一键部署（systemd 守护）
+│   └── nginx.conf.example # Nginx 反代 + 口令保护样例
 └── output/                # 报告输出目录（自动创建）
 ```
 

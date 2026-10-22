@@ -2015,6 +2015,8 @@ def parse_holding_text(text):
 
 
 if __name__ == "__main__":
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    print(f"A股全景扫描 Web 版: http://localhost:{port}", flush=True)
-    HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    # 服务器部署: 优先读环境变量 PORT/BIND(systemd/Docker); 本地: python3 app.py 8080
+    port = int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8080))
+    bind = os.environ.get("BIND", "0.0.0.0")
+    print(f"A股全景扫描 Web 版: http://{bind}:{port}", flush=True)
+    HTTPServer((bind, port), Handler).serve_forever()
