@@ -12,7 +12,7 @@ A股全景扫描 Web 版 (纯标准库, 零依赖)
 import json, ssl, time, re, sys, os, threading
 import urllib.request
 from urllib.parse import quote, urlparse, parse_qs
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "scripts"))
@@ -45,29 +45,88 @@ def _fnum(x):
         return None
 
 
-def fetch_all_stocks(max_age=21600):
+_LIST_DISK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output", "all_stocks_cache.json")
+
+
+def _load_list_disk():
+    """磁盘快照兜底: 服务重启/爬取失败时用上次成功数据(行业/搜索用途可接受)"""
+    try:
+        if os.path.exists(_LIST_DISK):
+            d = json.load(open(_LIST_DISK, encoding="utf-8"))
+            if d.get("stocks"):
+                return d["stocks"]
+    except Exception:
+        pass
+    return []
+
+
+def _save_list_disk(stocks):
+    try:
+        os.makedirs(OUT_DIR, exist_ok=True)
+        json.dump({"ts": time.time(), "stocks": stocks}, open(_LIST_DISK, "w", encoding="utf-8"), ensure_ascii=False)
+    except Exception:
+        pass
+
+
+def fetch_all_stocks(max_age=21600, stale_ok=True):
     """全A快照归一化: code/name/price/pe/pb/mktcap亿/dy/chg60/ytd, 缓存6小时
     主源: 东财 clist | 备源: 腾讯 rank(东财限流时自动降级, 无PB/股息率)
-    防部分抓取: 东财实得<80%总数时尝试腾讯源, 取数量多者(避免漏斗/搜索漏股)"""
+    防部分抓取: 东财实得<80%总数时尝试腾讯源, 取数量多者(避免漏斗/搜索漏股)
+    爬取失败时回退磁盘上次快照(stale_ok), 保证扫描/选股永远有数据可用"""
     with _LIST_LOCK:
         if time.time() - _LIST_CACHE["ts"] < max_age and _LIST_CACHE["stocks"]:
             return _LIST_CACHE["stocks"]
-    stocks, total = _fetch_em_list()
-    if total and len(stocks) < total * 0.8:
-        qq = _fetch_qq_list()
-        if len(qq) > len(stocks):
-            stocks = qq
+    try:
+        stocks, total = _fetch_em_list()
+        # 东财失败(空)或部分抓取(<80%)时都尝试腾讯源, 取数量多者
+        if not stocks or (total and len(stocks) < total * 0.8):
+            qq = _fetch_qq_list()
+            if len(qq) > len(stocks):
+                stocks = qq
+    except Exception:
+        stocks = []
+        try:
+            stocks = _fetch_qq_list()
+        except Exception:
+            stocks = []
+    if not stocks and stale_ok:
+        stocks = _load_list_disk()
     if stocks:
         with _LIST_LOCK:
             _LIST_CACHE.update({"ts": time.time(), "stocks": stocks})
+        _save_list_disk(stocks)
     return stocks
 
 
+def cached_stocks():
+    """只读快照(内存优先, 磁盘兜底), 永不触发网络爬取 — 供个股扫描/搜索/持仓解析等非关键路径:
+    行业名、行业对标、PE分位缺了只降级为NA, 绝不能让用户等1~3分钟的全市场爬取"""
+    with _LIST_LOCK:
+        if _LIST_CACHE["stocks"]:
+            return _LIST_CACHE["stocks"]
+    return _load_list_disk()
+
+
+_EM_HOSTS = ("push2.eastmoney.com", "1.push2.eastmoney.com", "82.push2.eastmoney.com")
+
+
 def _fetch_em_list():
+    """东财clist全A列表: push2主站不稳(海外502/限流)时自动轮换镜像主机"""
+    for host in _EM_HOSTS:
+        try:
+            stocks, total = _fetch_em_list_host(host)
+            if stocks:
+                return stocks, total
+        except Exception:
+            continue
+    return [], 0
+
+
+def _fetch_em_list_host(host):
     stocks, pn, total = [], 1, None
     pz = 100  # 东财服务端已将每页强制截断为100条(传500也只返回100)
     while True:
-        url = ("https://push2.eastmoney.com/api/qt/clist/get?pn=%d&pz=%d&po=1&np=1"
+        url = ("https://" + host + "/api/qt/clist/get?pn=%d&pz=%d&po=1&np=1"
                "&fltt=2&invt=2&fid=f12&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23"
                "&fields=f12,f14,f2,f9,f23,f20,f24,f25,f133,f100" % (pn, pz))
         d = _gj(url, retry=1)
@@ -93,14 +152,19 @@ def _fetch_em_list():
 
 
 def _fetch_qq_list():
-    stocks, offset = [], 0
+    stocks, offset, miss = [], 0, 0
     while offset < 5600:
         url = ("https://proxy.finance.qq.com/cgi/cgi-bin/rank/hs/getBoardRankList"
                f"?board_code=aStock&sort_type=price&direct=down&offset={offset}&count=200")
         d = _gj(url, retry=1)
         rows = ((d or {}).get("data") or {}).get("rank_list") or []
         if not rows:
-            break
+            miss += 1
+            if miss >= 2:  # 连续2页空才认为到底(单页偶发限流重试一次)
+                break
+            time.sleep(1)
+            continue
+        miss = 0
         for r in rows:
             code = re.sub(r"^(sh|sz|bj)", "", r.get("code", ""))
             stocks.append({
@@ -552,10 +616,10 @@ def _next_report(code, sfx):
 
 
 def _industry_bench(ind, pe, m60):
-    """行业对标: 同行业家数/PE中位数与分位/60日涨幅中位数与该股分位(全A快照)"""
+    """行业对标: 同行业家数/PE中位数与分位/60日涨幅中位数与该股分位(全A快照, 只读缓存)"""
     if not ind:
         return None
-    stocks = [s for s in (fetch_all_stocks() or []) if s.get("ind") == ind]
+    stocks = [s for s in cached_stocks() if s.get("ind") == ind]
     if len(stocks) < 5:
         return None
     pes = sorted(v for s in stocks for v in [_fnum(s["pe"])] if v and v > 0)
@@ -665,10 +729,10 @@ def decision_support(code, sfx, quote, tech, K, g, decision, ind, lifts):
 # ---------------- 风险因子层(11层扫描, 补齐深度分析遗漏) ----------------
 
 def _industry_pe_percentile(ind, pe):
-    """个股PE在行业内的分位(基于全A快照, 缓存6小时)。数据不足或无行业时返回 (None, 0)"""
+    """个股PE在行业内的分位(基于全A快照只读缓存, 缺数据降级NA)。"""
     if not ind or pe is None or pe <= 0:
         return None, 0
-    stocks = fetch_all_stocks() or []
+    stocks = cached_stocks()
     pes = sorted(v for s in stocks if s.get("ind") == ind
                  for v in [_fnum(s["pe"])] if v and v > 0)
     if len(pes) < 10:
@@ -1525,7 +1589,7 @@ def _deep_impl(code):
     c = base["code"]
     mkt, sfx, _ = ss.market(c)
     # 行业名(用于行业估值分位): 从全A快照查(缓存内零成本)
-    ind = next((s.get("ind") for s in (fetch_all_stocks() or []) if s.get("code") == c), None)
+    ind = next((s.get("ind") for s in cached_stocks() if s.get("code") == c), None)
     closes, dates, ksrc = _kline_with_source(c, mkt)
     K = {**base["key"], "扣非YoY": base.get("kfyoy"), "周期分位": base.get("cycle")}
     rl = risk_layers(c, K, base["quote"], earn=base["earn"], lifts=base["lifts"], ind=ind)
@@ -1826,7 +1890,7 @@ def _scan_json_impl(code):
         op_lines.append(f"- 利润创新高：年度扣非处近10年分位 {int(cyc*100)}% 且仍在增长（成长股特征，非周期风险）")
     time.sleep(0.3)
     dec = build_decision(quote, tech, K, total, g)
-    ind = next((s.get("ind") for s in (fetch_all_stocks() or []) if s.get("code") == code), None)
+    ind = next((s.get("ind") for s in cached_stocks() if s.get("code") == code), None)
     support = decision_support(code, sfx, quote, tech, K, g, dec, ind,
                                [{"date": str(r.get("FREE_DATE"))[:10], "num": r.get("LIFT_NUM"), "ratio": r.get("TOTAL_RATIO")} for r in lifts])
     # 趋势补充: 4期净利趋势
@@ -2361,11 +2425,14 @@ function fmt(v,d=2){return (v===null||v===undefined||v==='-')?'—':Number(v).to
 function pct(v){if(v===null||v===undefined||v==='-')return '—';const n=Number(v);const cls=n>0?'up':(n<0?'dn':'');return `<span class="${cls}">${n>0?'+':''}${n.toFixed(1)}%</span>`}
 
 let _lastScan='';
+function tickTimer(id){const t0=Date.now();const iv=setInterval(()=>{const el=document.getElementById(id);if(!el){clearInterval(iv);return}el.textContent='已用时 '+Math.round((Date.now()-t0)/1000)+' 秒（请勿关闭页面）';},1000);}
+
 async function doScan(code, fresh){
   code=(code||'').replace(/[^0-9]/g,'');
   if(!code)return;
   _lastScan=code;
-  $('#result').innerHTML='<div class="card loading">正在扫描 '+code+' …（拉取行情/K线/财务/分红/解禁，约5~10秒）</div>';
+  $('#result').innerHTML='<div class="card loading" id="scanLd">正在扫描 '+code+' … <b id="scanEl"></b><br><span class="muted">依次拉取行情/K线/财务/分红/解禁：热缓存约5~10秒；服务器刚重启后首次约30~90秒，请耐心等待</span></div>';
+  tickTimer('scanEl');
   try{
     const r=await fetch('/api/scan?code='+code+(fresh?'&fresh=1':''));const d=await r.json();
     if(d.error){$('#result').innerHTML='<div class="card warn">✗ '+d.error+'</div>';return}
@@ -2475,7 +2542,8 @@ async function doDeep(code, fresh){
   const box=$('#deepBox');
   box.style.display='';
   box.className='card loading';
-  box.innerHTML='深度分析中…（扫描+财务核验+专业数据面板+报告生成，约10~25秒）';
+  box.innerHTML='深度分析中… <b id="deepEl"></b><br><span class="muted">扫描+财务核验+专业数据面板+报告生成：热缓存约10~25秒；服务器刚重启后首次约30~120秒</span>';
+  tickTimer('deepEl');
   box.scrollIntoView({behavior:'smooth',block:'start'});
   try{
     const r=await fetch('/api/deep?code='+code+(fresh?'&fresh=1':''));const d=await r.json();
@@ -2570,7 +2638,7 @@ async function doDeep(code, fresh){
 
 let lastScreen=null,lastFunnel=null;
 async function runScreen(st){  const box=$('#screenResult');
-  box.className='card loading';box.textContent='正在全市场初筛…（首次需加载全部A股快照，约10~30秒）';
+  box.className='card loading';box.innerHTML='正在全市场初筛… <b id="scrEl"></b><br><span class="muted">需加载全部A股快照(约5500只)：热缓存约10~30秒；服务器刚重启后首次约30~120秒</span>';tickTimer('scrEl');
   try{
     const r=await fetch('/api/screen?strategy='+st);const d=await r.json();
     if(d.error){box.className='card warn';box.textContent='✗ '+d.error;return}
@@ -2682,7 +2750,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "text/html; charset=utf-8", HTML)
             elif u.path == "/api/search":
                 q = (qs.get("q", [""])[0] or "").strip().lower()
-                stocks = fetch_all_stocks()
+                stocks = cached_stocks()
                 res = []
                 for s in stocks:
                     if q.isdigit() and s["code"].startswith(q):
@@ -2742,7 +2810,7 @@ def parse_holding_text(text):
     text = text or ""
     if len(text) > 20000:
         text = text[:20000]
-    stocks = fetch_all_stocks() or []
+    stocks = cached_stocks()
     used = [False] * (len(text) + 1)
     found = []
 
@@ -2783,5 +2851,21 @@ if __name__ == "__main__":
     # 服务器部署: 优先读环境变量 PORT/BIND(systemd/Docker); 本地: python3 app.py 8080
     port = int(os.environ.get("PORT") or (sys.argv[1] if len(sys.argv) > 1 else 8080))
     bind = os.environ.get("BIND", "0.0.0.0")
+    # 启动预热: 先用磁盘快照秒级回填内存(行业/搜索立即可用), 再后台刷新全市场列表
+    _pre = _load_list_disk()
+    if _pre:
+        with _LIST_LOCK:
+            _LIST_CACHE.update({"ts": 0, "stocks": _pre})
+        print(f"快照预热: 磁盘载入 {len(_pre)} 只(后台将刷新)", flush=True)
+
+    def _warmup():
+        try:
+            n = len(fetch_all_stocks())
+            print(f"全市场快照就绪: {n} 只", flush=True)
+        except Exception as e:
+            print(f"快照预热失败(磁盘兜底可用): {e}", flush=True)
+
+    threading.Thread(target=_warmup, daemon=True).start()
     print(f"A股全景扫描 Web 版: http://{bind}:{port}", flush=True)
-    HTTPServer((bind, port), Handler).serve_forever()
+    ThreadingHTTPServer.daemon_threads = True
+    ThreadingHTTPServer((bind, port), Handler).serve_forever()
