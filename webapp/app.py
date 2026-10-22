@@ -1285,7 +1285,7 @@ def scan_json(code):
             "dim": k, "score": (-(a) if k == "风险扣分" else a + b), "full": (None if k == "风险扣分" else full),
             "note": S["风险扣分"][1] if k == "风险扣分" else "",
         })
-    return {
+    base = {
         "code": code, "name": quote.get("名称"), "quote": quote, "tech": tech,
         "ind": ind,
         "earn": [earn[t] for t in ["H1", "FY", "prevH1", "prevFY"] if t in earn],
@@ -1297,6 +1297,131 @@ def scan_json(code):
         "kf": (pa or {}).get("扣非最新"), "kfyoy": (pa or {}).get("扣非YoY"), "cycle": cyc,
         "opinion": op_lines, "profit_trend": trend, "time": ss.TODAY,
     }
+    _archive_signal(base)
+    return base
+
+
+# ---------------- 信号回看(存档→验证命中率) ----------------
+
+SIGNALS_PATH = os.path.join(OUT_DIR, "signals.json")
+_SIGNALS_LOCK = threading.Lock()
+
+
+def _signal_kind(action):
+    """信号三分类: 正向(可执行买入)/中性(观察等待)/回避"""
+    if action in ("建仓", "小仓试探", "等企稳再建仓"):
+        return "正向"
+    if action == "回避":
+        return "回避"
+    return "中性"
+
+
+def _archive_signal(base):
+    """扫描即存档: 只记录公开市场数据(代码/评分/决策/触发价), 供 N 天后回看验证。
+    不含任何用户持仓/成本/收益信息; 文件位于 .gitignore 排除的 output/ 目录, 不入库不上传"""
+    try:
+        dec = base.get("decision") or {}
+        act = dec.get("action")
+        price = (base.get("quote") or {}).get("现价")
+        if not act or not price:
+            return
+        sig = {
+            "code": base["code"], "name": base.get("name"), "ind": base.get("ind"),
+            "date": ss.TODAY, "ts": time.strftime("%Y-%m-%d %H:%M"),
+            "price": price, "total": base.get("total"), "grade": base.get("grade"),
+            "action": act, "kind": _signal_kind(act),
+            "risk": (base.get("risk_layers") or {}).get("level"),
+            "stop": next((l["price"] for l in dec.get("levels", []) if "止损" in l.get("label", "")), None),
+        }
+        with _SIGNALS_LOCK:
+            os.makedirs(OUT_DIR, exist_ok=True)
+            sigs = []
+            if os.path.exists(SIGNALS_PATH):
+                try:
+                    sigs = json.load(open(SIGNALS_PATH, encoding="utf-8")).get("signals", [])
+                except Exception:
+                    sigs = []
+            # 同一股票同一天只保留最新一条(重复扫描去重)
+            sigs = [s for s in sigs if not (s.get("code") == sig["code"] and s.get("date") == sig["date"])]
+            sigs.append(sig)
+            with open(SIGNALS_PATH, "w", encoding="utf-8") as f:
+                json.dump({"signals": sigs[-3000:]}, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass  # 存档失败不影响扫描主流程
+
+
+def _qq_batch_prices(codes):
+    """腾讯行情批量现价: {code: price}, 每批50只"""
+    out = {}
+    for i in range(0, len(codes), 50):
+        chunk = codes[i:i + 50]
+        url = "https://qt.gtimg.cn/q=" + ",".join(market_prefix(c) + c for c in chunk)
+        try:
+            req = urllib.request.Request(url, headers=_UA)
+            with urllib.request.urlopen(req, timeout=12, context=_ctx) as r:
+                txt = r.read().decode("GBK", "ignore")
+            for m in re.finditer(r'v_[a-z]{2}(\d{6})="([^"]+)"', txt):
+                f = m.group(2).split("~")
+                if len(f) > 3 and f[3]:
+                    try:
+                        out[m.group(1)] = float(f[3])
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return out
+
+
+def signals_review():
+    """信号回看: 存档信号 vs 最新行情 → 收益/命中率统计
+    命中率口径: 正向信号=存档7天后收益>0占比; 回避信号=存档7天后确实下跌占比(避损率)"""
+    if not os.path.exists(SIGNALS_PATH):
+        return {"total": 0, "signals": [], "stats": None,
+                "note": "暂无存档信号。每次个股扫描/深度分析会自动存档评分与决策触发价，7天后开始可验证命中率。"}
+    try:
+        sigs = json.load(open(SIGNALS_PATH, encoding="utf-8")).get("signals", [])
+    except Exception:
+        return {"error": "存档文件读取失败，可删除 output/signals.json 后重试"}
+    import datetime
+    today = datetime.date.today()
+    rows = []
+    for s in sigs:
+        r = dict(s)
+        try:
+            r["age"] = (today - datetime.date.fromisoformat(s["date"])).days
+        except Exception:
+            r["age"] = 0
+        r["kind"] = _signal_kind(s.get("action"))
+        rows.append(r)
+    prices = _qq_batch_prices(sorted({s["code"] for s in rows if s["age"] >= 7 and s.get("price")}))
+    for r in rows:
+        if r["age"] >= 7 and r.get("price") and prices.get(r["code"]):
+            r["now"] = prices[r["code"]]
+            r["ret"] = round((prices[r["code"]] / r["price"] - 1) * 100, 2)
+    matured = [r for r in rows if "ret" in r]
+
+    def _avg(rs):
+        return round(sum(x["ret"] for x in rs) / len(rs), 2) if rs else None
+
+    def _pct(n, d):
+        return round(100 * n / d) if d else None
+
+    pos = [r for r in matured if r["kind"] == "正向"]
+    neg = [r for r in matured if r["kind"] == "回避"]
+    stats = None
+    if matured:
+        stats = {
+            "matured": len(matured),
+            "pos_n": len(pos), "pos_avg": _avg(pos),
+            "pos_win": _pct(sum(1 for x in pos if x["ret"] > 0), len(pos)),
+            "neg_n": len(neg), "neg_avg": _avg(neg),
+            "neg_avoid": _pct(sum(1 for x in neg if x["ret"] < 0), len(neg)),
+            "stop_breach": sum(1 for x in pos if x.get("stop") and x["now"] < x["stop"]),
+        }
+    rows.sort(key=lambda x: x.get("date", ""), reverse=True)
+    return {"total": len(sigs), "signals": rows[:150], "stats": stats,
+            "note": "口径：存档满7天开始验证；正向命中率=存档7天后收益>0占比；回避避损率=回避标的确实下跌占比。"}
 
 
 # ---------------- HTTP ----------------
@@ -1360,6 +1485,7 @@ th{color:var(--sub);font-weight:500;font-size:12px}
     <button data-tab="funnel">多轮漏斗选股</button>
     <button data-tab="watch">自选清单</button>
     <button data-tab="hold">持仓体检</button>
+    <button data-tab="signals">信号回看</button>
     <button data-tab="logic">选股逻辑</button>
   </div>
 
@@ -1439,6 +1565,14 @@ th{color:var(--sub);font-weight:500;font-size:12px}
     </div>
   </div>
 
+  <div id="tab-signals" style="display:none">
+    <div class="searchbar">
+      <button onclick="loadSignals()">📊 刷新信号回看</button>
+      <span class="muted" style="align-self:center">每次扫描/深度分析自动存档评分与触发价（仅公开市场数据），满 7 天开始验证命中率</span>
+    </div>
+    <div id="sigBox"><div class="card muted">点击「刷新信号回看」查看历史信号的后续表现与命中率统计。</div></div>
+  </div>
+
   <div id="tab-logic" style="display:none">
     <div class="card">
       <h3 style="margin-bottom:10px">评分体系（100分 − 风险扣分）</h3>
@@ -1499,7 +1633,7 @@ let suggTimer=null,suggPick=false;
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('.tabs button').forEach(x=>x.classList.remove('on'));
   b.classList.add('on');
-  ['scan','screen','funnel','watch','hold','logic'].forEach(t=>$('#tab-'+t).style.display=t===b.dataset.tab?'':'none');
+  ['scan','screen','funnel','watch','hold','signals','logic'].forEach(t=>$('#tab-'+t).style.display=t===b.dataset.tab?'':'none');
   if(b.dataset.tab==='watch')renderWL();
 });
 
@@ -1565,6 +1699,32 @@ async function batchScore(codes,boxId,label){
 }
 function exportWLCsv(){const l=wl();if(!l.length){toast('清单为空');return}
   dlCSV(`自选清单_${new Date().toISOString().slice(0,10)}.csv`,['代码','名称'],l.map(s=>[s.code,s.name]))}
+
+async function loadSignals(){const box=$('#sigBox');
+  box.className='card loading';box.textContent='正在核对存档信号与最新行情…';
+  try{
+    const r=await fetch('/api/signals');const d=await r.json();
+    if(d.error){box.className='card warn';box.textContent='✗ '+d.error;return}
+    if(!d.total){box.className='card muted';box.textContent=d.note;return}
+    const st=d.stats,kindTag={正向:'tag',中性:'tag warn',回避:'tag dn'};
+    const statHtml=st?`<div class="card"><div class="logo-t">命中率统计（存档满7天的信号 ${st.matured} 条）</div>
+      <table><tr><th>信号类型</th><th>数量</th><th>平均收益</th><th>命中口径</th></tr>
+      <tr><td><span class="tag">正向</span>(建仓/试探)</td><td>${st.pos_n}</td><td class="${(st.pos_avg||0)>=0?'up':'dn'}">${st.pos_avg===null?'—':(st.pos_avg>0?'+':'')+st.pos_avg+'%'}</td><td><b>${st.pos_win===null?'样本不足':st.pos_win+'%'}</b> 收益&gt;0 占比</td></tr>
+      <tr><td><span class="tag dn">回避</span></td><td>${st.neg_n}</td><td class="${(st.neg_avg||0)>=0?'up':'dn'}">${st.neg_avg===null?'—':(st.neg_avg>0?'+':'')+st.neg_avg+'%'}</td><td><b>${st.neg_avoid===null?'样本不足':st.neg_avoid+'%'}</b> 确实下跌占比(避损率)</td></tr></table>
+      ${st.stop_breach?`<p class="warn" style="margin-top:8px">⚠ 正向信号中已有 ${st.stop_breach} 条跌破止损红线——按纪律应离场，命中统计不含此类</p>`:''}
+      <p class="muted" style="margin-top:8px">${d.note} ｜ 统计随存档积累自动更新，30/90 天视角需数据沉淀</p></div>`:'';
+    const rows=d.signals.map(s=>{
+      const pend=s.age<7;
+      return `<tr><td>${s.date}</td><td><b>${s.name}</b><div class="muted">${s.code}</div></td>
+      <td><span class="${kindTag[s.kind]||'tag'}">${s.kind}</span> ${s.action}</td>
+      <td><b>${s.total}</b> ${s.grade}</td><td>${fmt(s.price)}</td>
+      <td>${pend?'<span class="muted">存档中</span>':(s.ret===undefined?'<span class="muted">行情缺失</span>':`<span class="${s.ret>=0?'up':'dn'}">${s.ret>0?'+':''}${s.ret}%</span><div class="muted">现价 ${fmt(s.now)}</div>`)}</td>
+      <td class="muted">${s.risk||'—'}</td></tr>`}).join('');
+    box.className='';box.innerHTML=`${statHtml}
+    <div class="card"><div class="logo-t">信号存档（共 ${d.total} 条，每股票每天保留最新一条）</div>
+    <table><tr><th>日期</th><th>标的</th><th>信号</th><th>评分</th><th>存档价</th><th>7天后表现</th><th>风险</th></tr>${rows}</table>
+    <p class="muted" style="margin-top:10px">*存档仅含公开市场数据（代码/评分/决策/价位），无任何持仓或个人信息；历史表现不代表未来。*</p></div>`;
+  }catch(e){box.className='card warn';box.textContent='请求失败：'+e}}
 
 // ---------------- 持仓体检(文本→提取标的→批量扫描→低分置顶) ----------------
 let holdStocks=[];
@@ -1960,6 +2120,10 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(400, "application/json; charset=utf-8", json.dumps({"error": "未知策略"}))
                     return
                 res = screen(st)
+                self._send(200, "application/json; charset=utf-8",
+                           json.dumps(res, ensure_ascii=False))
+            elif u.path == "/api/signals":
+                res = signals_review()
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(res, ensure_ascii=False))
             else:
