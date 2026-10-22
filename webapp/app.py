@@ -1091,7 +1091,20 @@ def _build_data_range(quote, dates, closes, ksrc, earn, divs, lifts, f10_n):
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output")
 
 
-def deep_analysis(code):
+def deep_analysis(code, fresh=False):
+    """个股深度分析: 复用 scan_json 全量数据 → 持仓三态决策 + 数据范围声明 + Markdown 报告落盘"""
+    key = "deep:" + re.sub(r"\D", "", code or "")
+    if not fresh:
+        hit = _cache_get(key)
+        if hit is not None:
+            return hit
+    d = _deep_impl(code)
+    if d and not d.get("error"):
+        _cache_put(key, d)
+    return d
+
+
+def _deep_impl(code):
     """个股深度分析: 复用 scan_json 全量数据 → 持仓三态决策 + 数据范围声明 + Markdown 报告落盘"""
     base = scan_json(code)
     if "error" in base:
@@ -1240,7 +1253,42 @@ def batch_scan(codes):
 
 # ---------------- 全景扫描(JSON) ----------------
 
-def scan_json(code):
+# ---------------- 结果缓存(跨洋/限流场景下加速重复扫描, 默认10分钟) ----------------
+
+_SCAN_CACHE = {"map": {}, "lock": threading.Lock()}
+_SCAN_TTL = 600
+
+
+def _cache_get(key):
+    with _SCAN_CACHE["lock"]:
+        hit = _SCAN_CACHE["map"].get(key)
+        if hit and time.time() - hit[0] < _SCAN_TTL:
+            return hit[1]
+    return None
+
+
+def _cache_put(key, val):
+    with _SCAN_CACHE["lock"]:
+        _SCAN_CACHE["map"][key] = (time.time(), val)
+        # 防膨胀: 只保留最近60条
+        if len(_SCAN_CACHE["map"]) > 60:
+            for k in sorted(_SCAN_CACHE["map"], key=lambda k: _SCAN_CACHE["map"][k][0])[:-60]:
+                _SCAN_CACHE["map"].pop(k, None)
+
+
+def scan_json(code, fresh=False):
+    key = "scan:" + re.sub(r"\D", "", code or "")
+    if not fresh:
+        hit = _cache_get(key)
+        if hit is not None:
+            return hit
+    d = _scan_json_impl(code)
+    if d and not d.get("error"):
+        _cache_put(key, d)
+    return d
+
+
+def _scan_json_impl(code):
     code = re.sub(r"\D", "", code)
     if not code:
         return {"error": "无效代码"}
@@ -2102,11 +2150,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(res, ensure_ascii=False))
             elif u.path == "/api/scan":
-                d = scan_json(qs.get("code", [""])[0])
+                d = scan_json(qs.get("code", [""])[0], fresh=qs.get("fresh", ["0"])[0] == "1")
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(d, ensure_ascii=False))
             elif u.path == "/api/deep":
-                d = deep_analysis(qs.get("code", [""])[0])
+                d = deep_analysis(qs.get("code", [""])[0], fresh=qs.get("fresh", ["0"])[0] == "1")
                 self._send(200, "application/json; charset=utf-8",
                            json.dumps(d, ensure_ascii=False))
             elif u.path == "/api/batch":
