@@ -1251,6 +1251,19 @@ def _tech_panel(closes, dates, tech):
     return out
 
 
+def _stock_industry(code, sfx):
+    """单股行业兜底(东财F10基本资料, 海外可用): 全A快照无行业(腾讯降级源)时使用, 取EM2016末段如'白酒'"""
+    try:
+        rows = _dc_rows("RPT_F10_BASIC_ORGINFO", f'(SECUCODE="{code}{sfx}")',
+                        order="SECUCODE", n=1, retry=1)
+        if rows:
+            em = rows[0].get("EM2016") or ""
+            return em.split("-")[-1] or None
+    except Exception:
+        pass
+    return None
+
+
 def _valuation_pro(code, ind_bench=None):
     """估值历史分位(约3年窗口): PE-TTM/PB/PS + 行业PE中位对比"""
     try:
@@ -1589,7 +1602,7 @@ def _deep_impl(code):
     c = base["code"]
     mkt, sfx, _ = ss.market(c)
     # 行业名(用于行业估值分位): 从全A快照查(缓存内零成本)
-    ind = next((s.get("ind") for s in cached_stocks() if s.get("code") == c), None)
+    ind = next((s.get("ind") for s in cached_stocks() if s.get("code") == c), None) or _stock_industry(c, sfx)
     closes, dates, ksrc = _kline_with_source(c, mkt)
     K = {**base["key"], "扣非YoY": base.get("kfyoy"), "周期分位": base.get("cycle")}
     rl = risk_layers(c, K, base["quote"], earn=base["earn"], lifts=base["lifts"], ind=ind)
@@ -1890,7 +1903,7 @@ def _scan_json_impl(code):
         op_lines.append(f"- 利润创新高：年度扣非处近10年分位 {int(cyc*100)}% 且仍在增长（成长股特征，非周期风险）")
     time.sleep(0.3)
     dec = build_decision(quote, tech, K, total, g)
-    ind = next((s.get("ind") for s in cached_stocks() if s.get("code") == code), None)
+    ind = next((s.get("ind") for s in cached_stocks() if s.get("code") == code), None) or _stock_industry(code, sfx)
     support = decision_support(code, sfx, quote, tech, K, g, dec, ind,
                                [{"date": str(r.get("FREE_DATE"))[:10], "num": r.get("LIFT_NUM"), "ratio": r.get("TOTAL_RATIO")} for r in lifts])
     # 趋势补充: 4期净利趋势
